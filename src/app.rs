@@ -576,6 +576,23 @@ impl ApplicationHandler<UiEvent> for App {
                     };
                     if let Some(h) = h {
                         self.hotkey(el, h);
+                        return;
+                    }
+                }
+                // Keys the hook forwarded were swallowed and never reach the window, so
+                // anything arriving here still has to go to the host (e.g. cloud desktops,
+                // where low-level hooks see no keys at all).
+                if input::grabbed() && self.focused {
+                    use winit::platform::scancode::PhysicalKeyExtScancode;
+                    if let Some(sc) = event.physical_key.to_scancode() {
+                        let (scancode, extended) = (sc & 0xff, sc & 0xff00 == 0xe000);
+                        if scancode != 0 {
+                            self.send_input(Ev::Key(pb::Key {
+                                scancode,
+                                extended,
+                                down: event.state == ElementState::Pressed,
+                            }));
+                        }
                     }
                 }
             }
