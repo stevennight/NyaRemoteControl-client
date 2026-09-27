@@ -64,6 +64,9 @@ pub struct App {
     remote_buttons: u8,
     repaint_at: Option<Instant>,
     exit: bool,
+    hovering_file: bool,
+    /// Files dropped on the window, sent together once the drop is complete.
+    dropped: Vec<PathBuf>,
 }
 
 fn hwnd(window: &Window) -> Option<windows::Win32::Foundation::HWND> {
@@ -155,6 +158,8 @@ impl App {
             remote_buttons: 0,
             repaint_at: None,
             exit: false,
+            hovering_file: false,
+            dropped: Vec::new(),
         }
     }
 
@@ -499,6 +504,31 @@ impl App {
                 }
                 Action::SetGrab(on) => self.set_grab(on),
                 Action::Disconnect => self.end_session(Some(Notice::Info("已断开连接".into()))),
+                Action::PickFiles => {
+                    if let Some(paths) = rfd::FileDialog::new().set_title("选择要发送到被控端的文件").pick_files() {
+                        if let Some(s) = &mut self.session {
+                            s.send_files(paths);
+                        }
+                    }
+                }
+                Action::AcceptOffer(id) => {
+                    if let Some(s) = &mut self.session {
+                        s.accept_offer(id);
+                    }
+                }
+                Action::DismissOffer(id) => {
+                    if let Some(s) = &mut self.session {
+                        s.dismiss_offer(id);
+                    }
+                }
+                Action::DismissTransfer(id) => {
+                    if let Some(s) = &mut self.session {
+                        s.dismiss_transfer(id);
+                    }
+                }
+                Action::OpenFolder(p) => {
+                    let _ = std::process::Command::new("explorer").arg(p).spawn();
+                }
             }
         }
     }
@@ -509,10 +539,10 @@ impl App {
         let Some(window) = self.window.clone() else { return };
         let Some(mut gui) = self.gui.take() else { return };
         let mut actions = Vec::new();
-        let (toolbar_open, fullscreen) = (self.toolbar_open, self.fullscreen);
+        let (toolbar_open, fullscreen, hovering_file) = (self.toolbar_open, self.fullscreen, self.hovering_file);
         let (session, launcher, cfg) = (&mut self.session, &mut self.launcher, &mut self.cfg);
         let frame = gui.run(&window, |ctx| match session.as_mut() {
-            Some(s) => ui::session_overlay(ctx, s, toolbar_open, fullscreen, &mut actions),
+            Some(s) => ui::session_overlay(ctx, s, toolbar_open, fullscreen, hovering_file, &mut actions),
             None => ui::launcher(ctx, launcher, cfg, &mut actions),
         });
 
@@ -821,6 +851,18 @@ impl ApplicationHandler<UiEvent> for App {
                 }
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
+            WindowEvent::HoveredFile(_) if self.session.is_some() => {
+                self.hovering_file = true;
+                window.request_redraw();
+            }
+            WindowEvent::HoveredFileCancelled => {
+                self.hovering_file = false;
+                window.request_redraw();
+            }
+            WindowEvent::DroppedFile(p) if self.session.is_some() => {
+                self.hovering_file = false;
+                self.dropped.push(p.clone());
+            }
             WindowEvent::Moved(_) => {
                 // Moving to a monitor on another GPU: follow it (design doc §3.5, client side).
                 if let (Some(m), Ok(topo)) = (window.current_monitor(), Topology::enumerate()) {
@@ -863,6 +905,26 @@ impl ApplicationHandler<UiEvent> for App {
             }
             UiEvent::Hotkey(h) => self.hotkey(h),
             UiEvent::Disconnected(msg) => self.end_session(Some(Notice::Error(msg))),
+            UiEvent::FileOffer(o) => {
+                if let Some(s) = &mut self.session {
+                    s.on_offer(o);
+                }
+            }
+            UiEvent::FileResult(r) => {
+                if let Some(s) = &mut self.session {
+                    s.on_file_result(r);
+                }
+            }
+            UiEvent::Transfer(u) => {
+                if let Some(s) = &mut self.session {
+                    s.on_transfer(u);
+                }
+            }
+            UiEvent::ClipboardImage(dib) => {
+                if let Some(s) = &self.session {
+                    s.clipboard_image_from_host(dib);
+                }
+            }
             other => {
                 let Some(s) = self.session.as_mut() else { return };
                 match other {
@@ -904,6 +966,14 @@ impl ApplicationHandler<UiEvent> for App {
             return;
         }
         let mut redraw = false;
+        // One drop delivers one DroppedFile event per file; send them as a batch.
+        if !self.dropped.is_empty() {
+            let files = std::mem::take(&mut self.dropped);
+            if let Some(s) = &mut self.session {
+                s.send_files(files);
+            }
+            redraw = true;
+        }
         if let Some(s) = &mut self.session {
             if s.tick() {
                 redraw = s.show_stats;

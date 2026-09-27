@@ -17,6 +17,7 @@ mod net;
 mod render;
 mod session;
 mod stats;
+mod transfer;
 mod ui;
 mod video;
 

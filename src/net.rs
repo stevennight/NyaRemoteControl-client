@@ -198,7 +198,15 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
         Err(e) => return End::Lost(format!("{e:#}")),
     };
 
-    let uni = tokio::spawn(accept_uni(conn.clone(), sinks.video.clone(), sinks.ui.clone(), sinks.stats.clone()));
+    let files_on = neg.has(Feature::FileTransfer);
+    let images_on = neg.has(Feature::ClipboardImage);
+    let uni = tokio::spawn(accept_uni(
+        conn.clone(),
+        sinks.video.clone(),
+        sinks.ui.clone(),
+        sinks.stats.clone(),
+        (files_on, images_on),
+    ));
     let dgram = tokio::spawn(read_datagrams(conn.clone(), sinks.audio.clone(), neg.has(Feature::Audio)));
     let mut ping = tokio::time::interval(Duration::from_secs(1));
     let clipboard = neg.has(Feature::ClipboardText);
@@ -220,6 +228,8 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
                     Some(Msg::ServerStats(s)) => sinks.ui.send(UiEvent::ServerStats(s)),
                     Some(Msg::ClipboardText(c)) if clipboard => sinks.ui.send(UiEvent::Clipboard(c.text)),
                     Some(Msg::Pong(p)) => sinks.stats.on_pong(p.t_us, p.server_t_us),
+                    Some(Msg::FileOffer(o)) if files_on => sinks.ui.send(UiEvent::FileOffer(o)),
+                    Some(Msg::FileResult(r)) => sinks.ui.send(UiEvent::FileResult(r)),
                     Some(Msg::Bye(b)) => break End::Fatal(format!("被控端断开：{}", b.reason)),
                     Some(other) => tracing::debug!("ignoring {other:?}"),
                     None => tracing::debug!("ignoring unknown control message"),
@@ -240,6 +250,22 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
                         break End::Lost(format!("control: {e}"));
                     }
                 }
+                Some(NetCmd::SendFiles(paths)) => {
+                    if files_on {
+                        tokio::spawn(crate::transfer::upload(conn.clone(), paths, sinks.ui.clone()));
+                    } else {
+                        sinks.ui.send(UiEvent::FileResult(pb::FileResult {
+                            ok: false,
+                            message: "被控端版本不支持文件传输，请升级被控端".into(),
+                            ..Default::default()
+                        }));
+                    }
+                }
+                Some(NetCmd::SendImage(dib)) => {
+                    if images_on {
+                        tokio::spawn(crate::transfer::send_image(conn.clone(), dib));
+                    }
+                }
                 Some(NetCmd::Quit) | None => {
                     let _ = write_msg(&mut send, &ctl(Msg::Bye(pb::Bye { reason: "用户断开".into() }))).await;
                     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -258,11 +284,13 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
     end
 }
 
-async fn accept_uni(conn: Connection, video: Sender<VideoIn>, ui: Ui, stats: Arc<Shared>) {
+async fn accept_uni(conn: Connection, video: Sender<VideoIn>, ui: Ui, stats: Arc<Shared>, (files_on, images_on): (bool, bool)) {
+    let downloads = Arc::new(crate::transfer::Downloads::default());
     while let Ok(mut r) = conn.accept_uni().await {
-        let (video, ui, stats) = (video.clone(), ui.clone(), stats.clone());
+        let (video, ui, stats, downloads) = (video.clone(), ui.clone(), stats.clone(), downloads.clone());
         tokio::spawn(async move {
             match read_varint(&mut r).await {
+                Ok(Some(stream_type::FILE)) => crate::transfer::receive(r, ui, downloads, files_on, images_on).await,
                 Ok(Some(stream_type::VIDEO)) => {
                     let Ok(Some(stream_id)) = read_varint(&mut r).await else { return };
                     tracing::info!("video stream {stream_id} opened by host");

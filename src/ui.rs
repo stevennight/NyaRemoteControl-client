@@ -8,7 +8,7 @@ use nya_ui::egui;
 use crate::config::{ClientConfig, Defaults};
 use crate::events::Hotkey;
 use crate::input;
-use crate::session::Session;
+use crate::session::{Session, TransferState};
 
 pub enum Action {
     Connect { target: String, name: Option<String> },
@@ -25,6 +25,20 @@ pub enum Action {
     SelectDisplay(u32),
     SetGrab(bool),
     Disconnect,
+    PickFiles,
+    AcceptOffer(u64),
+    DismissOffer(u64),
+    DismissTransfer(u64),
+    OpenFolder(std::path::PathBuf),
+}
+
+fn size_text(b: u64) -> String {
+    match b {
+        b if b >= 1 << 30 => format!("{:.2} GB", b as f64 / (1u64 << 30) as f64),
+        b if b >= 1 << 20 => format!("{:.1} MB", b as f64 / (1u64 << 20) as f64),
+        b if b >= 1 << 10 => format!("{:.0} KB", b as f64 / 1024.0),
+        b => format!("{b} B"),
+    }
 }
 
 pub enum Notice {
@@ -331,7 +345,14 @@ fn encoder_label(c: &str) -> &'static str {
 }
 
 /// Toolbar and statistics shown over the remote picture.
-pub fn session_overlay(ctx: &egui::Context, s: &mut Session, toolbar_open: bool, fullscreen: bool, actions: &mut Vec<Action>) {
+pub fn session_overlay(
+    ctx: &egui::Context,
+    s: &mut Session,
+    toolbar_open: bool,
+    fullscreen: bool,
+    hovering_file: bool,
+    actions: &mut Vec<Action>,
+) {
     let near_top = ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| p.y < 6.0);
     let show_bar = toolbar_open || near_top || ctx.memory(|m| m.any_popup_open());
 
@@ -386,6 +407,9 @@ pub fn session_overlay(ctx: &egui::Context, s: &mut Session, toolbar_open: bool,
                     if ui.toggle_value(&mut stats, "统计").on_hover_text("Ctrl+Alt+Shift+S").changed() {
                         actions.push(Action::Hotkey(Hotkey::ToggleStats));
                     }
+                    if ui.button("发送文件…").on_hover_text("也可以直接把文件拖进窗口").clicked() {
+                        actions.push(Action::PickFiles);
+                    }
                     if ui.button("Ctrl+Alt+Del").on_hover_text("Ctrl+Alt+Shift+D").clicked() {
                         actions.push(Action::Hotkey(Hotkey::CtrlAltDel));
                     }
@@ -409,6 +433,21 @@ pub fn session_overlay(ctx: &egui::Context, s: &mut Session, toolbar_open: bool,
             });
     }
 
+    transfers_panel(ctx, s, actions);
+
+    if hovering_file {
+        egui::Area::new(egui::Id::new("drop-hint"))
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).inner_margin(24.0).show(ui, |ui| {
+                    ui.label(RichText::new("松开鼠标，把文件发送到被控端").size(20.0).strong());
+                    ui.label(RichText::new("保存在被控端的 下载\\NyaRemoteControl，并放入被控端剪贴板").weak());
+                });
+            });
+    }
+
     if s.show_stats {
         let mut open = true;
         egui::Window::new("统计")
@@ -425,4 +464,68 @@ pub fn session_overlay(ctx: &egui::Context, s: &mut Session, toolbar_open: bool,
             actions.push(Action::Hotkey(Hotkey::ToggleStats));
         }
     }
+}
+
+/// Bottom-right panel: host file offers and running / finished transfers.
+fn transfers_panel(ctx: &egui::Context, s: &Session, actions: &mut Vec<Action>) {
+    if s.offers.is_empty() && s.transfers.is_empty() {
+        return;
+    }
+    egui::Area::new(egui::Id::new("transfers"))
+        .anchor(Align2::RIGHT_BOTTOM, [-16.0, -16.0])
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            ui.set_max_width(380.0);
+            for o in &s.offers {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    let total: u64 = o.files.iter().map(|f| f.size).sum();
+                    let first = o.files.first().map(|f| f.name.as_str()).unwrap_or("");
+                    let what = if o.files.len() == 1 { first.to_string() } else { format!("{} 等 {} 个文件", first, o.files.len()) };
+                    ui.label(RichText::new("被控端复制了文件").strong());
+                    ui.label(format!("{what}（{}）", size_text(total)));
+                    ui.horizontal(|ui| {
+                        if ui.button(RichText::new("下载到本机").strong()).clicked() {
+                            actions.push(Action::AcceptOffer(o.transfer_id));
+                        }
+                        if ui.button("忽略").clicked() {
+                            actions.push(Action::DismissOffer(o.transfer_id));
+                        }
+                    });
+                });
+            }
+            for t in s.transfers.iter().rev().take(4) {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(if t.upload { "↑ 发送" } else { "↓ 下载" }).strong());
+                        ui.label(&t.name);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if !matches!(t.state, TransferState::Running) && ui.small_button("✕").clicked() {
+                                actions.push(Action::DismissTransfer(t.id));
+                            }
+                        });
+                    });
+                    match &t.state {
+                        TransferState::Running => {
+                            let frac = if t.total > 0 { t.done as f32 / t.total as f32 } else { 0.0 };
+                            ui.add(
+                                egui::ProgressBar::new(frac)
+                                    .text(format!("{} / {}", size_text(t.done), size_text(t.total)))
+                                    .desired_width(340.0),
+                            );
+                        }
+                        TransferState::Done(m) => {
+                            ui.label(RichText::new(m).color(Color32::LIGHT_GREEN));
+                            if let Some(f) = &t.folder {
+                                if ui.button("打开文件夹").clicked() {
+                                    actions.push(Action::OpenFolder(f.clone()));
+                                }
+                            }
+                        }
+                        TransferState::Failed(m) => {
+                            ui.label(RichText::new(m).color(Color32::from_rgb(255, 120, 110)));
+                        }
+                    }
+                });
+            }
+        });
 }

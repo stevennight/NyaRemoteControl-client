@@ -12,11 +12,31 @@ use nya_win::d3d::D3dDevice;
 use tokio::sync::mpsc::UnboundedSender;
 use winit::window::CustomCursor;
 
-use crate::events::{NetCmd, Ui};
+use crate::clipboard::ClipIn;
+use crate::events::{NetCmd, TransferUpdate, Ui};
 use crate::net::{self, Link, Params, Sinks};
 use crate::stats::{Shared, Summary};
 use crate::video::{FrameStore, Slot, VideoIn, VideoThread};
 use crate::input;
+
+#[derive(Debug, Clone)]
+pub enum TransferState {
+    Running,
+    Done(String),
+    Failed(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct TransferView {
+    pub id: u64,
+    pub upload: bool,
+    pub name: String,
+    pub done: u64,
+    pub total: u64,
+    pub state: TransferState,
+    /// Local folder with the downloaded files.
+    pub folder: Option<std::path::PathBuf>,
+}
 
 pub struct SessionOptions {
     pub hw_decode: bool,
@@ -30,7 +50,9 @@ pub struct Session {
     video_tx: Sender<VideoIn>,
     pub stats: Arc<Shared>,
     pub store: Arc<FrameStore>,
-    clip_tx: Option<Sender<String>>,
+    clip_tx: Option<Sender<ClipIn>>,
+    pub transfers: Vec<TransferView>,
+    pub offers: Vec<pb::FileOffer>,
     /// Current stream request (display, mode …), replayed on reconnect.
     pub start: pb::StartStream,
     pub status: String,
@@ -103,6 +125,8 @@ impl Session {
             stats,
             store,
             clip_tx,
+            transfers: Vec::new(),
+            offers: Vec::new(),
             start,
             status: "连接中".into(),
             info: None,
@@ -171,7 +195,115 @@ impl Session {
 
     pub fn clipboard_from_host(&self, text: String) {
         if let Some(tx) = &self.clip_tx {
-            let _ = tx.send(text);
+            let _ = tx.send(ClipIn::Text(text));
+        }
+    }
+
+    pub fn clipboard_image_from_host(&self, dib: Vec<u8>) {
+        if let Some(tx) = &self.clip_tx {
+            let _ = tx.send(ClipIn::Image(dib));
+        }
+    }
+
+    pub fn send_files(&mut self, paths: Vec<std::path::PathBuf>) {
+        if !paths.is_empty() {
+            let _ = self.net_tx.send(NetCmd::SendFiles(paths));
+        }
+    }
+
+    /// Download the files of a host offer.
+    pub fn accept_offer(&mut self, id: u64) {
+        let Some(i) = self.offers.iter().position(|o| o.transfer_id == id) else { return };
+        let o = self.offers.remove(i);
+        let total = o.files.iter().map(|f| f.size).sum();
+        self.transfers.push(TransferView {
+            id,
+            upload: false,
+            name: format!("{} 个文件", o.files.len()),
+            done: 0,
+            total,
+            state: TransferState::Running,
+            folder: None,
+        });
+        let _ = self.net_tx.send(ctl(Msg::FileRequest(pb::FileRequest { transfer_id: id })));
+    }
+
+    pub fn dismiss_offer(&mut self, id: u64) {
+        self.offers.retain(|o| o.transfer_id != id);
+    }
+
+    pub fn dismiss_transfer(&mut self, id: u64) {
+        self.transfers.retain(|t| t.id != id);
+    }
+
+    pub fn on_offer(&mut self, o: pb::FileOffer) {
+        self.offers.retain(|x| x.transfer_id != o.transfer_id);
+        self.offers.push(o);
+        // Only the latest few matter.
+        while self.offers.len() > 3 {
+            self.offers.remove(0);
+        }
+    }
+
+    pub fn on_transfer(&mut self, u: TransferUpdate) {
+        let t = match self.transfers.iter_mut().find(|t| t.id == u.id) {
+            Some(t) => t,
+            None => {
+                self.transfers.push(TransferView {
+                    id: u.id,
+                    upload: u.upload,
+                    name: String::new(),
+                    done: 0,
+                    total: u.total,
+                    state: TransferState::Running,
+                    folder: None,
+                });
+                self.transfers.last_mut().unwrap()
+            }
+        };
+        if !u.name.is_empty() {
+            t.name = u.name;
+        }
+        t.done = t.done.max(u.done);
+        if u.total > 0 {
+            t.total = u.total;
+        }
+        if u.folder.is_some() {
+            t.folder = u.folder;
+        }
+        match u.finished {
+            Some(Ok(m)) => {
+                t.state = TransferState::Done(m);
+                t.done = t.total.max(t.done);
+            }
+            Some(Err(m)) => t.state = TransferState::Failed(m),
+            None => {}
+        }
+    }
+
+    /// The host's verdict on an upload (or a failed download).
+    pub fn on_file_result(&mut self, r: pb::FileResult) {
+        let state = if r.ok {
+            TransferState::Done(if r.saved_to.is_empty() { r.message.clone() } else { format!("{}，位置：{}", r.message, r.saved_to) })
+        } else {
+            TransferState::Failed(r.message.clone())
+        };
+        match self.transfers.iter_mut().find(|t| t.id == r.transfer_id) {
+            Some(t) => {
+                t.state = state;
+                if r.ok {
+                    t.done = t.total.max(t.done);
+                }
+            }
+            None => self.transfers.push(TransferView {
+                id: r.transfer_id,
+                upload: true,
+                name: String::new(),
+                done: 0,
+                total: 0,
+                state,
+                folder: None,
+            }),
         }
     }
 
