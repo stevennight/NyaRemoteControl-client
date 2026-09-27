@@ -72,6 +72,8 @@ pub enum UiEvent {
     FileOffer(pb::FileOffer),
     FileResult(pb::FileResult),
     Transfer(TransferUpdate),
+    UsbStatus(pb::UsbStatus),
+    UsbDevices(Result<Vec<crate::usb::UsbDevice>, String>),
     /// Clipboard image from the host.
     ClipboardImage(Vec<u8>),
     /// The host wants a pairing code; answer through the sender (None = cancel).

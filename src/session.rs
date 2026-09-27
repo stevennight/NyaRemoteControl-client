@@ -53,6 +53,11 @@ pub struct Session {
     clip_tx: Option<Sender<ClipIn>>,
     pub transfers: Vec<TransferView>,
     mic_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+    pub usb_open: bool,
+    pub usb_devices: Option<Result<Vec<crate::usb::UsbDevice>, String>>,
+    /// busid -> (attached on the host, last message)
+    pub usb_state: HashMap<String, (bool, String)>,
+    pub usb_busy: std::collections::HashSet<String>,
     pub offers: Vec<pb::FileOffer>,
     /// Current stream request (display, mode …), replayed on reconnect.
     pub start: pb::StartStream,
@@ -128,6 +133,10 @@ impl Session {
             clip_tx,
             transfers: Vec::new(),
             mic_stop: None,
+            usb_open: false,
+            usb_devices: None,
+            usb_state: HashMap::new(),
+            usb_busy: Default::default(),
             offers: Vec::new(),
             start,
             status: "连接中".into(),
@@ -226,6 +235,20 @@ impl Session {
             crate::mic::spawn(self.net_tx.clone(), stop.clone());
             self.mic_stop = Some(stop);
         }
+    }
+
+    pub fn usb_available(&self) -> bool {
+        self.info.as_ref().is_some_and(|i| i.usb_available)
+    }
+
+    pub fn usb_detach(&mut self, busid: &str) {
+        self.usb_busy.insert(busid.to_owned());
+        let _ = self.net_tx.send(ctl(Msg::UsbDetach(pb::UsbDetach { busid: busid.to_owned() })));
+    }
+
+    pub fn on_usb_status(&mut self, st: pb::UsbStatus) {
+        self.usb_busy.remove(&st.busid);
+        self.usb_state.insert(st.busid, (st.attached, st.message));
     }
 
     pub fn ctrl_alt_del(&self) {

@@ -508,6 +508,44 @@ impl App {
                     }
                 }
                 Action::SetGrab(on) => self.set_grab(on),
+                Action::ToggleUsb => {
+                    let open = self.session.as_ref().is_some_and(|s| !s.usb_open);
+                    if let Some(s) = &mut self.session {
+                        s.usb_open = open;
+                    }
+                    if open {
+                        self.refresh_usb();
+                    }
+                }
+                Action::RefreshUsb => self.refresh_usb(),
+                Action::UsbAttach { busid, description, bound } => {
+                    if let Some(s) = &mut self.session {
+                        s.usb_busy.insert(busid.clone());
+                        let (net, ui) = (s.net_tx.clone(), self.ui_tx.clone());
+                        std::thread::spawn(move || {
+                            // Share it with usbipd first (UAC prompt), then ask the host to attach.
+                            let shared = if bound { Ok(()) } else { crate::usb::bind(&busid) };
+                            match shared {
+                                Ok(()) => {
+                                    let m = pb::ControlMsg {
+                                        msg: Some(pb::control_msg::Msg::UsbAttach(pb::UsbAttach { busid, description })),
+                                    };
+                                    let _ = net.send(crate::events::NetCmd::Control(m));
+                                }
+                                Err(e) => ui.send(UiEvent::UsbStatus(pb::UsbStatus {
+                                    busid,
+                                    attached: false,
+                                    message: format!("{e:#}"),
+                                })),
+                            }
+                        });
+                    }
+                }
+                Action::UsbDetach(busid) => {
+                    if let Some(s) = &mut self.session {
+                        s.usb_detach(&busid);
+                    }
+                }
                 Action::SetMic(on) => {
                     if let Some(s) = &mut self.session {
                         s.set_mic(on);
@@ -613,6 +651,14 @@ impl App {
             self.apply(actions);
             self.request_redraw();
         }
+    }
+
+    fn refresh_usb(&mut self) {
+        if let Some(s) = &mut self.session {
+            s.usb_devices = None;
+        }
+        let ui = self.ui_tx.clone();
+        std::thread::spawn(move || ui.send(UiEvent::UsbDevices(crate::usb::list().map_err(|e| format!("{e:#}")))));
     }
 
     fn map_mouse(&self, x: f64, y: f64) -> Option<(u32, u32)> {
@@ -933,6 +979,16 @@ impl ApplicationHandler<UiEvent> for App {
             UiEvent::Transfer(u) => {
                 if let Some(s) = &mut self.session {
                     s.on_transfer(u);
+                }
+            }
+            UiEvent::UsbStatus(st) => {
+                if let Some(s) = &mut self.session {
+                    s.on_usb_status(st);
+                }
+            }
+            UiEvent::UsbDevices(r) => {
+                if let Some(s) = &mut self.session {
+                    s.usb_devices = Some(r);
                 }
             }
             UiEvent::ClipboardImage(dib) => {

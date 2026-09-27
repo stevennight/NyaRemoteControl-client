@@ -20,6 +20,7 @@ mod session;
 mod stats;
 mod transfer;
 mod ui;
+mod usb;
 mod video;
 
 use anyhow::{anyhow, Result};

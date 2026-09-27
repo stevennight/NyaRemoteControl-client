@@ -26,6 +26,10 @@ pub enum Action {
     SetGrab(bool),
     SetPolicy(nya_proto::pb::BitratePolicy),
     SetMic(bool),
+    ToggleUsb,
+    RefreshUsb,
+    UsbAttach { busid: String, description: String, bound: bool },
+    UsbDetach(String),
     Disconnect,
     PickFiles,
     AcceptOffer(u64),
@@ -481,6 +485,12 @@ pub fn session_overlay(
                     if ui.toggle_value(&mut stats, "统计").on_hover_text("Ctrl+Alt+Shift+S").changed() {
                         actions.push(Action::Hotkey(Hotkey::ToggleStats));
                     }
+                    if s.usb_available() {
+                        let mut open = s.usb_open;
+                        if ui.toggle_value(&mut open, "USB 设备").on_hover_text("把本机 USB 设备透传到被控端").changed() {
+                            actions.push(Action::ToggleUsb);
+                        }
+                    }
                     if ui.button("发送文件…").on_hover_text("也可以直接把文件拖进窗口").clicked() {
                         actions.push(Action::PickFiles);
                     }
@@ -511,6 +521,9 @@ pub fn session_overlay(
     }
 
     transfers_panel(ctx, s, actions);
+    if s.usb_open {
+        usb_window(ctx, s, actions);
+    }
 
     if hovering_file {
         egui::Area::new(egui::Id::new("drop-hint"))
@@ -605,4 +618,69 @@ fn transfers_panel(ctx: &egui::Context, s: &Session, actions: &mut Vec<Action>) 
                 });
             }
         });
+}
+
+fn usb_window(ctx: &egui::Context, s: &Session, actions: &mut Vec<Action>) {
+    let mut open = true;
+    egui::Window::new("USB 设备透传").open(&mut open).default_pos([60.0, 80.0]).default_width(460.0).show(ctx, |ui| {
+        if crate::usb::usbipd_exe().is_none() {
+            ui.label("需要在本机安装 usbipd-win（可选组件，开源免费）。");
+            if ui.button("打开 usbipd-win 下载页").clicked() {
+                let _ = std::process::Command::new("explorer").arg(crate::usb::DOWNLOAD_URL).spawn();
+            }
+            return;
+        }
+        ui.label(RichText::new("透传后设备在本机暂时不可用，断开或结束会话后自动归还。首次共享某个设备会请求一次管理员权限。").weak().small());
+        if ui.button("刷新").clicked() {
+            actions.push(Action::RefreshUsb);
+        }
+        ui.separator();
+        match &s.usb_devices {
+            None => {
+                ui.spinner();
+            }
+            Some(Err(e)) => {
+                ui.label(RichText::new(e).color(Color32::from_rgb(255, 120, 110)));
+            }
+            Some(Ok(list)) if list.is_empty() => {
+                ui.label(RichText::new("没有检测到 USB 设备").weak());
+            }
+            Some(Ok(list)) => {
+                egui::Grid::new("usb").num_columns(3).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
+                    for d in list {
+                        ui.label(format!("{}  [{}]", d.description, d.busid));
+                        let (attached, msg) = s.usb_state.get(&d.busid).cloned().unwrap_or((false, String::new()));
+                        if s.usb_busy.contains(&d.busid) {
+                            ui.spinner();
+                        } else if attached {
+                            ui.label(RichText::new("已透传").color(Color32::LIGHT_GREEN));
+                        } else if !msg.is_empty() {
+                            ui.label(RichText::new(&msg).color(Color32::from_rgb(255, 160, 120)).small());
+                        } else if d.in_use {
+                            ui.label(RichText::new("正被其他 USB/IP 客户端使用").weak().small());
+                        } else {
+                            ui.label("");
+                        }
+                        ui.add_enabled_ui(!s.usb_busy.contains(&d.busid), |ui| {
+                            if attached {
+                                if ui.button("停止").clicked() {
+                                    actions.push(Action::UsbDetach(d.busid.clone()));
+                                }
+                            } else if ui.button("透传").clicked() {
+                                actions.push(Action::UsbAttach {
+                                    busid: d.busid.clone(),
+                                    description: d.description.clone(),
+                                    bound: d.bound,
+                                });
+                            }
+                        });
+                        ui.end_row();
+                    }
+                });
+            }
+        }
+    });
+    if !open {
+        actions.push(Action::ToggleUsb);
+    }
 }

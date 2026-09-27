@@ -207,6 +207,26 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
         sinks.stats.clone(),
         (files_on, images_on),
     ));
+    let usb_on = neg.has(Feature::UsbRedirect);
+    let bidi = tokio::spawn({
+        let conn = conn.clone();
+        async move {
+            while let Ok((send, mut recv)) = conn.accept_bi().await {
+                tokio::spawn(async move {
+                    match (read_varint(&mut recv).await, read_varint(&mut recv).await) {
+                        (Ok(Some(stream_type::TUNNEL)), Ok(Some(port))) if usb_on => {
+                            if let Err(e) = crate::usb::tunnel(send, recv, port).await {
+                                tracing::debug!("usb tunnel: {e:#}");
+                            }
+                        }
+                        _ => {
+                            let _ = recv.stop(0u32.into());
+                        }
+                    }
+                });
+            }
+        }
+    });
     let dgram = tokio::spawn(read_datagrams(conn.clone(), sinks.audio.clone(), neg.has(Feature::Audio)));
     let mut ping = tokio::time::interval(Duration::from_secs(1));
     let clipboard = neg.has(Feature::ClipboardText);
@@ -230,6 +250,7 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
                     Some(Msg::Pong(p)) => sinks.stats.on_pong(p.t_us, p.server_t_us),
                     Some(Msg::FileOffer(o)) if files_on => sinks.ui.send(UiEvent::FileOffer(o)),
                     Some(Msg::FileResult(r)) => sinks.ui.send(UiEvent::FileResult(r)),
+                    Some(Msg::UsbStatus(u)) => sinks.ui.send(UiEvent::UsbStatus(u)),
                     Some(Msg::Bye(b)) => break End::Fatal(format!("被控端断开：{}", b.reason)),
                     Some(other) => tracing::debug!("ignoring {other:?}"),
                     None => tracing::debug!("ignoring unknown control message"),
@@ -285,6 +306,7 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
         }
     };
     uni.abort();
+    bidi.abort();
     dgram.abort();
     end
 }
