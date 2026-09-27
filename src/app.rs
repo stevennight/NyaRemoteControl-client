@@ -75,6 +75,9 @@ pub struct App {
     summary: Summary,
     status_log: Instant,
     last_rendered_total: u64,
+    mods: winit::keyboard::ModifiersState,
+    winit_keys: u64,
+    logged_keys: (u64, u64),
     exit_message: Option<String>,
 }
 
@@ -128,6 +131,9 @@ impl App {
             summary: Summary::default(),
             status_log: Instant::now(),
             last_rendered_total: 0,
+            mods: Default::default(),
+            winit_keys: 0,
+            logged_keys: (0, 0),
             exit_message: None,
         }
     }
@@ -306,6 +312,7 @@ impl App {
     }
 
     fn hotkey(&mut self, el: &ActiveEventLoop, h: Hotkey) {
+        tracing::info!("hotkey {h:?}");
         match h {
             Hotkey::ToggleGrab => {
                 input::set_grab(!input::grabbed());
@@ -404,6 +411,11 @@ impl App {
                 tracing::warn!("no new picture in 5 s: received {f} frames / {} KB, decoded {d}, rendered {r}", b / 1024);
             }
             self.last_rendered_total = r;
+            let keys = (input::hook_key_count(), self.winit_keys);
+            if keys != self.logged_keys {
+                tracing::info!("keys so far: hook {} / window {} (grab {})", keys.0, keys.1, input::grabbed());
+                self.logged_keys = keys;
+            }
         }
         self.last_tick = Instant::now();
         self.summary = self.stats.take_summary(secs);
@@ -536,6 +548,36 @@ impl ApplicationHandler<UiEvent> for App {
                     MouseButton::Other(_) => return,
                 };
                 self.send_input(Ev::MouseButton(pb::MouseButtonEv { button: b as i32, down: state == ElementState::Pressed }));
+            }
+            WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
+            WindowEvent::KeyboardInput { event, .. } => {
+                // Reaches us only when the hook didn't swallow the key (grab off, or the
+                // hook doesn't see keys in this environment). Hotkeys work either way.
+                use winit::keyboard::{KeyCode, PhysicalKey};
+                self.winit_keys += 1;
+                let m = self.mods;
+                if event.state == ElementState::Pressed && m.control_key() && m.alt_key() && m.shift_key() {
+                    let h = match event.physical_key {
+                        PhysicalKey::Code(KeyCode::KeyQ) => Some(Hotkey::ToggleGrab),
+                        PhysicalKey::Code(KeyCode::KeyS) => Some(Hotkey::ToggleStats),
+                        PhysicalKey::Code(KeyCode::KeyM) => Some(Hotkey::ToggleMode),
+                        PhysicalKey::Code(KeyCode::KeyR) => Some(Hotkey::ToggleRelative),
+                        PhysicalKey::Code(KeyCode::KeyF) => Some(Hotkey::ToggleFullscreen),
+                        PhysicalKey::Code(KeyCode::KeyD) => Some(Hotkey::CtrlAltDel),
+                        PhysicalKey::Code(KeyCode::KeyX) => Some(Hotkey::Quit),
+                        PhysicalKey::Code(c) => match c {
+                            KeyCode::Digit1 => Some(Hotkey::Display(1)),
+                            KeyCode::Digit2 => Some(Hotkey::Display(2)),
+                            KeyCode::Digit3 => Some(Hotkey::Display(3)),
+                            KeyCode::Digit4 => Some(Hotkey::Display(4)),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(h) = h {
+                        self.hotkey(el, h);
+                    }
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let (dx, dy) = match delta {

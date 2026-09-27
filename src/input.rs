@@ -26,6 +26,12 @@ struct HookState {
 }
 
 static STATE: OnceLock<HookState> = OnceLock::new();
+static HOOK_KEYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Key events our window received through the hook since start.
+pub fn hook_key_count() -> u64 {
+    HOOK_KEYS.load(Ordering::Relaxed)
+}
 
 const CTRL: u8 = 1;
 const ALT: u8 = 2;
@@ -93,6 +99,9 @@ unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
         // Injected keys are processed too: in cloud desktops / remote sessions
         // every keystroke arrives injected. We never inject locally, so no loop.
         if ours {
+            if HOOK_KEYS.fetch_add(1, Ordering::Relaxed) == 0 {
+                tracing::info!("keyboard hook: first key vk={:#x} scan={:#x} flags={:#x}", kb.vkCode, kb.scanCode, kb.flags.0);
+            }
             let down = kb.flags.0 & LLKHF_UP.0 == 0;
             let bit = modifier_bit(kb.vkCode);
             if bit != 0 {
