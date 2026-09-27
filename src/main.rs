@@ -140,6 +140,7 @@ fn real_main() -> Result<()> {
     std::fs::create_dir_all(&dir)?;
     let _log = init_logging(&dir);
     nya_media::check_runtime_versions()?;
+    nya_media::init_log_level();
     let mut cfg = ClientConfig::load(&dir)?;
 
     let (target, name) = match cli.cmd {
