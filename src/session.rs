@@ -189,6 +189,20 @@ impl Session {
         }
     }
 
+    pub fn bitrate_policy(&self) -> i32 {
+        self.start.config.as_ref().map(|c| c.bitrate_policy).unwrap_or(0)
+    }
+
+    /// Restarts the stream with the new policy.
+    pub fn set_bitrate_policy(&mut self, p: pb::BitratePolicy) {
+        if self.bitrate_policy() == p as i32 {
+            return;
+        }
+        self.start.config.get_or_insert_with(Default::default).bitrate_policy = p as i32;
+        let _ = self.net_tx.send(ctl(Msg::StartStream(self.start.clone())));
+        self.status = "正在切换码率策略…".into();
+    }
+
     pub fn ctrl_alt_del(&self) {
         let _ = self.net_tx.send(ctl(Msg::SendSas(pb::SendSas {})));
     }
@@ -369,17 +383,16 @@ impl Session {
                 if st.cross_gpu { format!("  跨显卡 [{}]→[{}]", st.capture_gpu_index, st.encode_gpu_index) } else { String::new() }
             ));
         }
-        let (sfps, skbps, enc_ms, xfer_ms, target) = self
+        let (sfps, skbps, enc_ms, xfer_ms, target, note) = self
             .server_stats
             .as_ref()
-            .map(|x| (x.fps, x.bitrate_kbps, x.encode_ms_p50, x.transfer_ms_p50, x.target_kbps))
+            .map(|x| (x.fps, x.bitrate_kbps, x.encode_ms_p50, x.transfer_ms_p50, x.target_kbps, x.bitrate_note.clone()))
             .unwrap_or_default();
         lines.push(format!("帧率  被控端 {sfps} / 本机 {}   丢帧 {}", s.fps, s.dropped));
-        lines.push(format!(
-            "码率  {:.1} Mbps   目标 {:.1} Mbps（自适应）",
-            skbps.max(s.kbps) as f32 / 1000.0,
-            target as f32 / 1000.0
-        ));
+        lines.push(format!("码率  实际 {:.1} Mbps   上限 {:.1} Mbps", skbps.max(s.kbps) as f32 / 1000.0, target as f32 / 1000.0));
+        if !note.is_empty() {
+            lines.push(format!("策略  {note}"));
+        }
         lines.push(format!("延迟  端到端 {:.1} ms   RTT {:.1} ms", s.latency_ms, s.rtt_ms));
         lines.push(format!("耗时  编码 {enc_ms:.1}  跨显卡 {xfer_ms:.1}  解码 {:.1}  渲染 {:.1} ms", s.decode_ms, s.render_ms));
         lines.push(format!("解码器  {}", s.decoder));

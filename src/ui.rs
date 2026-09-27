@@ -24,12 +24,36 @@ pub enum Action {
     SetGameMode(bool),
     SelectDisplay(u32),
     SetGrab(bool),
+    SetPolicy(nya_proto::pb::BitratePolicy),
     Disconnect,
     PickFiles,
     AcceptOffer(u64),
     DismissOffer(u64),
     DismissTransfer(u64),
     OpenFolder(std::path::PathBuf),
+}
+
+pub fn parse_policy(s: &str) -> nya_proto::pb::BitratePolicy {
+    use nya_proto::pb::BitratePolicy as P;
+    match s {
+        "quality" => P::Quality,
+        "balanced" => P::Balanced,
+        "smooth" => P::Smooth,
+        "fixed" => P::Fixed,
+        _ => P::Unspecified,
+    }
+}
+
+const POLICIES: [(&str, &str, &str); 5] = [
+    ("auto", "自动", "办公模式用“清晰优先”，游戏模式用“均衡”"),
+    ("quality", "清晰优先", "只有持续 2 秒以上严重发送不出去才降，最低保留 60%"),
+    ("balanced", "均衡", "持续积压或延迟明显上涨时降到实际能发送的速率，最低 35%"),
+    ("smooth", "流畅优先", "积压、延迟上涨、丢包都会触发，最低 15%，适合很差的网络"),
+    ("fixed", "固定码率", "从不自动调整"),
+];
+
+fn policy_label(s: &str) -> &'static str {
+    POLICIES.iter().find(|p| p.0 == s).map(|p| p.1).unwrap_or("自动")
 }
 
 fn size_text(b: u64) -> String {
@@ -269,6 +293,14 @@ fn settings(ui: &mut egui::Ui, d: &mut Defaults) -> bool {
         });
         ui.end_row();
 
+        ui.label("码率策略");
+        egui::ComboBox::from_id_salt("policy").selected_text(policy_label(&d.bitrate_policy)).show_ui(ui, |ui| {
+            for (key, name, tip) in POLICIES {
+                ui.selectable_value(&mut d.bitrate_policy, key.to_string(), name).on_hover_text(tip);
+            }
+        });
+        ui.end_row();
+
         ui.label("编码");
         egui::ComboBox::from_id_salt("codec").selected_text(codec_label(&d.codec)).show_ui(ui, |ui| {
             for c in ["auto", "hevc", "h264", "av1"] {
@@ -353,10 +385,21 @@ pub fn session_overlay(
     hovering_file: bool,
     actions: &mut Vec<Action>,
 ) {
-    let near_top = ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| p.y < 6.0);
-    let show_bar = toolbar_open || near_top || ctx.memory(|m| m.any_popup_open());
+    // The bar opens at the top edge and stays open while the pointer is on it
+    // (plus a margin), and for a moment after it leaves.
+    let state_id = egui::Id::new("toolbar-state");
+    let (last_rect, open_until): (Option<egui::Rect>, f64) = ctx.data(|d| d.get_temp(state_id)).unwrap_or((None, 0.0));
+    let now = ctx.input(|i| i.time);
+    let pointer = ctx.input(|i| i.pointer.hover_pos());
+    let near_top = pointer.is_some_and(|p| p.y < 6.0);
+    let on_bar = matches!((pointer, last_rect), (Some(p), Some(r)) if r.expand(16.0).contains(p));
+    let hold = toolbar_open || near_top || on_bar || ctx.memory(|m| m.any_popup_open());
+    let show_bar = hold || now < open_until;
+    if show_bar && !hold {
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
 
-    egui::Area::new(egui::Id::new("toolbar"))
+    let bar = egui::Area::new(egui::Id::new("toolbar"))
         .anchor(Align2::CENTER_TOP, [0.0, 0.0])
         .order(egui::Order::Foreground)
         .show(ctx, |ui| {
@@ -389,6 +432,15 @@ pub fn session_overlay(
                     if game != s.game {
                         actions.push(Action::SetGameMode(game));
                     }
+                    let current = s.bitrate_policy();
+                    let cur_key = POLICIES.iter().find(|p| parse_policy(p.0) as i32 == current).map(|p| p.0).unwrap_or("auto");
+                    egui::ComboBox::from_id_salt("policy-bar").selected_text(policy_label(cur_key)).show_ui(ui, |ui| {
+                        for (key, name, tip) in POLICIES {
+                            if ui.selectable_label(key == cur_key, name).on_hover_text(tip).clicked() {
+                                actions.push(Action::SetPolicy(parse_policy(key)));
+                            }
+                        }
+                    });
                     ui.separator();
 
                     let mut grab = input::grabbed();
@@ -420,6 +472,9 @@ pub fn session_overlay(
                 });
             });
         });
+
+    let until = if hold { now + 0.8 } else { open_until };
+    ctx.data_mut(|d| d.insert_temp(state_id, (Some(bar.response.rect), until)));
 
     if !s.status.is_empty() {
         egui::Area::new(egui::Id::new("status"))

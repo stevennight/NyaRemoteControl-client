@@ -117,6 +117,7 @@ fn start_request(d: &Defaults) -> pb::StartStream {
             fps: 0,
             bitrate_kbps: d.bitrate_kbps,
             mode: if game { pb::StreamMode::Game } else { pb::StreamMode::Office } as i32,
+            bitrate_policy: crate::ui::parse_policy(&d.bitrate_policy) as i32,
         }),
         encoder_preference: d.encoder.clone(),
     }
@@ -503,6 +504,11 @@ impl App {
                     }
                 }
                 Action::SetGrab(on) => self.set_grab(on),
+                Action::SetPolicy(p) => {
+                    if let Some(s) = &mut self.session {
+                        s.set_bitrate_policy(p);
+                    }
+                }
                 Action::Disconnect => self.end_session(Some(Notice::Info("已断开连接".into()))),
                 Action::PickFiles => {
                     if let Some(paths) = rfd::FileDialog::new().set_title("选择要发送到被控端的文件").pick_files() {
