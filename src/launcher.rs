@@ -39,3 +39,7 @@ pub fn pairing_code() -> Option<String> {
     println!("（开发模式下配对码显示在 nya-server standalone 的窗口里）。");
     read_line("配对码：")
 }
+
+pub fn confirm(prompt: &str) -> bool {
+    read_line(prompt).is_some_and(|s| matches!(s.to_ascii_lowercase().as_str(), "y" | "yes" | "是"))
+}

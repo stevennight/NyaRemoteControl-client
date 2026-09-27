@@ -194,7 +194,30 @@ fn real_main() -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     println!("正在连接 {addr} …");
     let prompt: net::PairPrompt = Arc::new(launcher::pairing_code);
-    let link = rt.block_on(net::connect(addr, &identity, pinned, &client_name, Some(prompt)))?;
+    let link = match rt.block_on(net::connect(addr, &identity, pinned, &client_name, Some(prompt.clone()))) {
+        Ok(l) => l,
+        Err(e) if pinned.is_some() && format!("{e:#}").contains(nya_transport::tls::PIN_MISMATCH) => {
+            println!();
+            println!("警告：被控端的证书和上次保存的不一样。");
+            println!("  常见原因：被控端从开发模式改成了服务模式，或者重装过；也可能有人在冒充被控端。");
+            if !launcher::confirm("是否重新验证这台被控端？(y/N)：") {
+                return Err(anyhow!("已取消连接"));
+            }
+            let l = rt.block_on(net::connect(addr, &identity, None, &client_name, Some(prompt)))?;
+            if l.welcome.needs_pairing {
+                println!("已通过配对码验证了新的被控端证书。");
+            } else {
+                // The host already knows us, so no pairing code proved its identity: compare by eye.
+                println!("新的证书指纹：{}", l.server_fp);
+                println!("请在被控端运行 `nya-server pair`，核对其中显示的“证书指纹”。");
+                if !launcher::confirm("两边的指纹一致吗？(y/N)：") {
+                    return Err(anyhow!("指纹未确认，已取消连接"));
+                }
+            }
+            l
+        }
+        Err(e) => return Err(e),
+    };
     let server_name = link.welcome.server_name.clone();
     println!("已连接到 {server_name}（证书 {}）", link.server_fp);
 
