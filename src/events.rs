@@ -13,6 +13,8 @@ pub enum NetCmd {
     SendFiles(Vec<std::path::PathBuf>),
     /// Local clipboard image (CF_DIB) for the host.
     SendImage(Vec<u8>),
+    /// Encoded MIC datagram.
+    Mic(Vec<u8>),
     Quit,
 }
 

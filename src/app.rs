@@ -508,6 +508,11 @@ impl App {
                     }
                 }
                 Action::SetGrab(on) => self.set_grab(on),
+                Action::SetMic(on) => {
+                    if let Some(s) = &mut self.session {
+                        s.set_mic(on);
+                    }
+                }
                 Action::SetPolicy(p) => {
                     if let Some(s) = &mut self.session {
                         s.set_bitrate_policy(p);

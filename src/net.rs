@@ -261,6 +261,11 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
                         }));
                     }
                 }
+                Some(NetCmd::Mic(d)) => {
+                    if neg.has(Feature::Microphone) {
+                        let _ = conn.send_datagram(d.into());
+                    }
+                }
                 Some(NetCmd::SendImage(dib)) => {
                     if images_on {
                         tokio::spawn(crate::transfer::send_image(conn.clone(), dib));

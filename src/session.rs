@@ -52,6 +52,7 @@ pub struct Session {
     pub store: Arc<FrameStore>,
     clip_tx: Option<Sender<ClipIn>>,
     pub transfers: Vec<TransferView>,
+    mic_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub offers: Vec<pb::FileOffer>,
     /// Current stream request (display, mode …), replayed on reconnect.
     pub start: pb::StartStream,
@@ -126,6 +127,7 @@ impl Session {
             store,
             clip_tx,
             transfers: Vec::new(),
+            mic_stop: None,
             offers: Vec::new(),
             start,
             status: "连接中".into(),
@@ -201,6 +203,29 @@ impl Session {
         self.start.config.get_or_insert_with(Default::default).bitrate_policy = p as i32;
         let _ = self.net_tx.send(ctl(Msg::StartStream(self.start.clone())));
         self.status = "正在切换码率策略…".into();
+    }
+
+    pub fn mic_on(&self) -> bool {
+        self.mic_stop.is_some()
+    }
+
+    /// Name of the host device that receives the microphone, if any.
+    pub fn host_mic_device(&self) -> Option<&str> {
+        self.info.as_ref().map(|i| i.mic_device.as_str()).filter(|n| !n.is_empty())
+    }
+
+    pub fn set_mic(&mut self, on: bool) {
+        if on == self.mic_on() {
+            return;
+        }
+        if let Some(stop) = self.mic_stop.take() {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if on {
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            crate::mic::spawn(self.net_tx.clone(), stop.clone());
+            self.mic_stop = Some(stop);
+        }
     }
 
     pub fn ctrl_alt_del(&self) {
@@ -406,6 +431,7 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        self.set_mic(false);
         input::set_session(None);
         let _ = self.net_tx.send(NetCmd::Quit);
     }

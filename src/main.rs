@@ -13,6 +13,7 @@ mod config;
 mod diag;
 mod events;
 mod input;
+mod mic;
 mod net;
 mod render;
 mod session;

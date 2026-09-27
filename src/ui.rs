@@ -25,6 +25,7 @@ pub enum Action {
     SelectDisplay(u32),
     SetGrab(bool),
     SetPolicy(nya_proto::pb::BitratePolicy),
+    SetMic(bool),
     Disconnect,
     PickFiles,
     AcceptOffer(u64),
@@ -448,6 +449,22 @@ pub fn session_overlay(
                     });
                     ui.separator();
 
+                    let mut mic = s.mic_on();
+                    match s.host_mic_device() {
+                        Some(dev) => {
+                            if ui
+                                .toggle_value(&mut mic, "🎤 麦克风")
+                                .on_hover_text(format!("本机麦克风 → 被控端“{dev}”。被控端软件请选择 CABLE Output 作为麦克风"))
+                                .changed()
+                            {
+                                actions.push(Action::SetMic(mic));
+                            }
+                        }
+                        None => {
+                            ui.add_enabled(false, egui::Button::new("🎤 麦克风"))
+                                .on_disabled_hover_text("被控端没有安装虚拟声卡 VB-Cable（可在被控端管理界面“可选组件”中查看）");
+                        }
+                    }
                     let mut grab = input::grabbed();
                     if ui.toggle_value(&mut grab, "键盘捕获").on_hover_text("Ctrl+Alt+Shift+Q").changed() {
                         actions.push(Action::SetGrab(grab));
