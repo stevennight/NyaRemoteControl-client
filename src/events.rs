@@ -58,6 +58,7 @@ pub struct ConnectDone {
 pub enum UiEvent {
     Connected,
     SessionInfo(pb::SessionInfo),
+    GamepadRumble(pb::GamepadRumble),
     StreamStarted(pb::StreamStarted),
     StreamError(String),
     Cursor(pb::CursorMsg),

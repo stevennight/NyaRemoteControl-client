@@ -8,6 +8,7 @@
 mod app;
 mod audio;
 mod caps;
+mod gamepad;
 mod clipboard;
 mod config;
 mod diag;

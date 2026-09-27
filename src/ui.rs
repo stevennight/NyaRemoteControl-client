@@ -469,6 +469,13 @@ pub fn session_overlay(
                                 .on_disabled_hover_text("被控端没有安装虚拟声卡 VB-Cable（可在被控端管理界面“可选组件”中查看）");
                         }
                     }
+                    if let Some(g) = &s.gamepads {
+                        let n = g.count();
+                        if n > 0 {
+                            ui.label(RichText::new(format!("🎮 {n}")).color(Color32::LIGHT_GREEN))
+                                .on_hover_text("本机手柄已映射为被控端的 Xbox 手柄（窗口在前台时生效）");
+                        }
+                    }
                     let mut grab = input::grabbed();
                     if ui.toggle_value(&mut grab, "键盘捕获").on_hover_text("Ctrl+Alt+Shift+Q").changed() {
                         actions.push(Action::SetGrab(grab));

@@ -53,6 +53,7 @@ pub struct Session {
     clip_tx: Option<Sender<ClipIn>>,
     pub transfers: Vec<TransferView>,
     mic_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+    pub gamepads: Option<crate::gamepad::Gamepads>,
     pub usb_open: bool,
     pub usb_devices: Option<Result<Vec<crate::usb::UsbDevice>, String>>,
     /// busid -> (attached on the host, last message)
@@ -133,6 +134,7 @@ impl Session {
             clip_tx,
             transfers: Vec::new(),
             mic_stop: None,
+            gamepads: None,
             usb_open: false,
             usb_devices: None,
             usb_state: HashMap::new(),
@@ -235,6 +237,16 @@ impl Session {
             crate::mic::spawn(self.net_tx.clone(), stop.clone());
             self.mic_stop = Some(stop);
         }
+    }
+
+    pub fn on_session_info(&mut self, info: pb::SessionInfo, focused: bool) {
+        // Forward local pads only when the host can create virtual ones.
+        if info.gamepad_available && self.gamepads.is_none() {
+            self.gamepads = Some(crate::gamepad::Gamepads::spawn(self.net_tx.clone(), focused));
+        } else if !info.gamepad_available {
+            self.gamepads = None;
+        }
+        self.info = Some(info);
     }
 
     pub fn usb_available(&self) -> bool {

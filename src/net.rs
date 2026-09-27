@@ -251,6 +251,7 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
                     Some(Msg::FileOffer(o)) if files_on => sinks.ui.send(UiEvent::FileOffer(o)),
                     Some(Msg::FileResult(r)) => sinks.ui.send(UiEvent::FileResult(r)),
                     Some(Msg::UsbStatus(u)) => sinks.ui.send(UiEvent::UsbStatus(u)),
+                    Some(Msg::GamepadRumble(r)) => sinks.ui.send(UiEvent::GamepadRumble(r)),
                     Some(Msg::Bye(b)) => break End::Fatal(format!("被控端断开：{}", b.reason)),
                     Some(other) => tracing::debug!("ignoring {other:?}"),
                     None => tracing::debug!("ignoring unknown control message"),

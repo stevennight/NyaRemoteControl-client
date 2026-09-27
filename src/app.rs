@@ -900,6 +900,9 @@ impl ApplicationHandler<UiEvent> for App {
             WindowEvent::Focused(f) => {
                 self.focused = *f;
                 self.update_no_hotkeys();
+                if let Some(g) = self.session.as_ref().and_then(|s| s.gamepads.as_ref()) {
+                    g.set_active(*f);
+                }
                 if !*f {
                     input::reset_modifiers();
                     if let Some(s) = &self.session {
@@ -1000,7 +1003,12 @@ impl ApplicationHandler<UiEvent> for App {
                 let Some(s) = self.session.as_mut() else { return };
                 match other {
                     UiEvent::Connected => s.status.clear(),
-                    UiEvent::SessionInfo(i) => s.info = Some(i),
+                    UiEvent::SessionInfo(i) => s.on_session_info(i, self.focused),
+                    UiEvent::GamepadRumble(r) => {
+                        if let Some(g) = &s.gamepads {
+                            g.rumble(&r);
+                        }
+                    }
                     UiEvent::StreamStarted(st) => {
                         tracing::info!(
                             "stream: {} {:?} cross_gpu={}",
