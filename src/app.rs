@@ -311,11 +311,19 @@ impl App {
         }
     }
 
+    /// While focused and grabbed, keep shell hotkeys (Win+D, …) from acting locally.
+    fn update_no_hotkeys(&self) {
+        if let Some(h) = self.window.as_ref().and_then(Self::hwnd) {
+            input::set_no_hotkeys(h, self.focused && input::grabbed() && input::active());
+        }
+    }
+
     fn hotkey(&mut self, el: &ActiveEventLoop, h: Hotkey) {
         tracing::info!("hotkey {h:?}");
         match h {
             Hotkey::ToggleGrab => {
                 input::set_grab(!input::grabbed());
+                self.update_no_hotkeys();
                 if !input::grabbed() {
                     self.send_input(Ev::ReleaseAll(pb::ReleaseAll {}));
                 }
@@ -413,7 +421,13 @@ impl App {
             self.last_rendered_total = r;
             let keys = (input::hook_key_count(), self.winit_keys);
             if keys != self.logged_keys {
-                tracing::info!("keys so far: hook {} / window {} (grab {})", keys.0, keys.1, input::grabbed());
+                tracing::info!(
+                    "keys so far: hook {} (hook calls {}) / window {} (grab {})",
+                    keys.0,
+                    input::hook_call_count(),
+                    keys.1,
+                    input::grabbed()
+                );
                 self.logged_keys = keys;
             }
         }
@@ -488,6 +502,7 @@ impl ApplicationHandler<UiEvent> for App {
         }
         if let Some(h) = hwnd {
             input::install(h, self.net_tx.clone(), self.ui.clone());
+            input::set_active(true);
         }
 
         let mut params = st.params;
@@ -510,6 +525,7 @@ impl ApplicationHandler<UiEvent> for App {
             WindowEvent::RedrawRequested => self.draw(),
             WindowEvent::Focused(f) => {
                 self.focused = f;
+                self.update_no_hotkeys();
                 if !f {
                     input::reset_modifiers();
                     self.send_input(Ev::ReleaseAll(pb::ReleaseAll {}));

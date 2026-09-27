@@ -1,6 +1,13 @@
-//! Keyboard capture through a low-level hook, so system combinations (Win,
-//! Alt+Tab, …) reach the remote while the window is focused and the keyboard
-//! is grabbed. Hotkeys are Ctrl+Alt+Shift+<key>.
+//! Keyboard capture.
+//!
+//! * A low-level hook forwards keys (including Win / Alt+Tab combinations)
+//!   while the window is focused and the keyboard is grabbed.
+//! * Some environments (cloud desktops) never deliver keys to low-level hooks;
+//!   there keys reach the window and are forwarded from window events. To keep
+//!   shell hotkeys such as Win+D / Win+E from acting locally, raw keyboard input
+//!   is registered with `RIDEV_NOHOTKEYS` while grabbed.
+//!
+//! Hotkeys are Ctrl+Alt+Shift+<key>.
 
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -27,6 +34,38 @@ struct HookState {
 
 static STATE: OnceLock<HookState> = OnceLock::new();
 static HOOK_KEYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static HOOK_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Hook invocations for any window (tells "hook not running" from "not our window").
+pub fn hook_call_count() -> u64 {
+    HOOK_CALLS.load(Ordering::Relaxed)
+}
+
+/// Forward keys only while a session is running (not in the launcher UI).
+pub fn set_active(on: bool) {
+    ACTIVE.store(on, Ordering::SeqCst);
+}
+
+pub fn active() -> bool {
+    ACTIVE.load(Ordering::SeqCst)
+}
+
+/// Suppress application-defined hotkeys (Win+D, Win+E, …) for our process.
+pub fn set_no_hotkeys(hwnd: HWND, on: bool) {
+    use windows::Win32::UI::Input::{RegisterRawInputDevices, RAWINPUTDEVICE, RIDEV_NOHOTKEYS, RAWINPUTDEVICE_FLAGS};
+    let dev = RAWINPUTDEVICE {
+        usUsagePage: 0x01, // generic desktop
+        usUsage: 0x06,     // keyboard
+        dwFlags: if on { RIDEV_NOHOTKEYS } else { RAWINPUTDEVICE_FLAGS(0) },
+        hwndTarget: hwnd,
+    };
+    unsafe {
+        if let Err(e) = RegisterRawInputDevices(&[dev], std::mem::size_of::<RAWINPUTDEVICE>() as u32) {
+            tracing::debug!("RegisterRawInputDevices(no_hotkeys={on}): {e}");
+        }
+    }
+}
 
 /// Key events our window received through the hook since start.
 pub fn hook_key_count() -> u64 {
@@ -93,12 +132,13 @@ fn modifier_bit(vk: u32) -> u8 {
 
 unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code == HC_ACTION as i32 {
+        HOOK_CALLS.fetch_add(1, Ordering::Relaxed);
         let s = state();
         let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
         let ours = GetForegroundWindow().0 as isize == s.hwnd.load(Ordering::Relaxed);
         // Injected keys are processed too: in cloud desktops / remote sessions
         // every keystroke arrives injected. We never inject locally, so no loop.
-        if ours {
+        if ours && ACTIVE.load(Ordering::Relaxed) {
             if HOOK_KEYS.fetch_add(1, Ordering::Relaxed) == 0 {
                 tracing::info!("keyboard hook: first key vk={:#x} scan={:#x} flags={:#x}", kb.vkCode, kb.scanCode, kb.flags.0);
             }
