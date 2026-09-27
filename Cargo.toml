@@ -12,6 +12,7 @@ nya-proto = { path = "../common/crates/nya-proto" }
 nya-transport = { path = "../common/crates/nya-transport" }
 nya-media = { path = "../common/crates/nya-media" }
 nya-win = { path = "../common/crates/nya-win" }
+nya-ui = { path = "../common/crates/nya-ui" }
 
 anyhow = "1"
 tracing = "0.1"
@@ -37,6 +38,7 @@ features = [
     "Win32_UI_Input",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_LibraryLoader",
+    "Win32_System_Console",
 ]
 
 [profile.release]

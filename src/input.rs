@@ -47,10 +47,6 @@ pub fn set_active(on: bool) {
     ACTIVE.store(on, Ordering::SeqCst);
 }
 
-pub fn active() -> bool {
-    ACTIVE.load(Ordering::SeqCst)
-}
-
 /// Suppress application-defined hotkeys (Win+D, Win+E, …) for our process.
 pub fn set_no_hotkeys(hwnd: HWND, on: bool) {
     use windows::Win32::UI::Input::{RegisterRawInputDevices, RAWINPUTDEVICE, RIDEV_NOHOTKEYS, RAWINPUTDEVICE_FLAGS};
@@ -86,10 +82,10 @@ fn state() -> &'static HookState {
     })
 }
 
-pub fn install(hwnd: HWND, tx: UnboundedSender<NetCmd>, ui: Ui) {
+/// Install the hook once per process.
+pub fn install(hwnd: HWND, ui: Ui) {
     let s = state();
     s.hwnd.store(hwnd.0 as isize, Ordering::SeqCst);
-    *s.tx.lock().unwrap() = Some(tx);
     *s.ui.lock().unwrap() = Some(ui);
     unsafe {
         let module = GetModuleHandleW(None).unwrap_or_default();
@@ -97,6 +93,13 @@ pub fn install(hwnd: HWND, tx: UnboundedSender<NetCmd>, ui: Ui) {
             tracing::error!("keyboard hook: {e}");
         }
     }
+}
+
+/// Where forwarded keys go; `None` outside a session. Also toggles forwarding.
+pub fn set_session(tx: Option<UnboundedSender<NetCmd>>) {
+    set_active(tx.is_some());
+    *state().tx.lock().unwrap() = tx;
+    reset_modifiers();
 }
 
 pub fn set_grab(on: bool) {

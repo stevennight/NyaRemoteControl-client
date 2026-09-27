@@ -1,278 +1,193 @@
-//! The winit application: window, input mapping, cursor, rendering, hotkeys.
+//! The winit application: one window that shows the launcher or a session,
+//! with the egui UI painted over the remote picture.
 
-use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, Sender};
-use nya_proto::frame::AudioPacket;
-use nya_proto::pb::{self, control_msg::Msg, cursor_msg, input_msg::Ev};
+use nya_proto::pb::{self, cursor_msg, input_msg::Ev};
+use nya_transport::{Fingerprint, Identity};
+use nya_ui::Gui;
 use nya_win::d3d::D3dDevice;
 use nya_win::topology::Topology;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalSize;
+use winit::dpi::LogicalSize;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::ActiveEventLoop;
+use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::platform::windows::MonitorHandleExtWindows;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use winit::window::{CursorGrabMode, CustomCursor, Fullscreen, Window, WindowId};
+use winit::window::{CursorGrabMode, CursorIcon, CustomCursor, Fullscreen, Window, WindowId};
 
-use crate::events::{Hotkey, NetCmd, Ui, UiEvent};
-use crate::net::{self, Link, Params, Sinks};
-use crate::overlay::{self, OverlayImage};
+use crate::config::{ClientConfig, Defaults, HostEntry};
+use crate::events::{ConnectDone, Hotkey, Ui, UiEvent};
+use crate::net::{self, Link, PairPrompt, Params};
 use crate::render::{fit, Renderer};
-use crate::stats::{Shared, Summary};
-use crate::video::{FrameStore, Slot, VideoIn, VideoThread};
+use crate::session::{Session, SessionOptions};
+use crate::ui::{self, Action, LauncherState, Notice, PairingDialog};
 use crate::{caps, input};
 
-/// Everything created before the window exists.
-pub struct Startup {
-    pub link: Link,
-    pub params: Params,
-    pub runtime: tokio::runtime::Handle,
-    pub net_rx: UnboundedReceiver<NetCmd>,
-    pub video_rx: Receiver<VideoIn>,
-    pub audio_rx: Receiver<AudioPacket>,
-    pub audio_tx: Sender<AudioPacket>,
-    pub audio: bool,
-    pub clipboard: bool,
-    pub max_fps: u32,
+/// A connection attempt in progress.
+struct Pending {
+    address: String,
+    label: Option<String>,
+    reverify: bool,
 }
 
 pub struct App {
-    startup: Option<Startup>,
-    ui: Ui,
-    net_tx: UnboundedSender<NetCmd>,
-    video_tx: Sender<VideoIn>,
-    stats: Arc<Shared>,
-    store: Arc<FrameStore>,
-    hw_decode: bool,
-    host_label: String,
-    start: pb::StartStream,
+    rt: tokio::runtime::Handle,
+    ui_tx: Ui,
+    data_dir: PathBuf,
+    cfg: ClientConfig,
+    identity: Identity,
+    client_name: String,
+    auto_connect: Option<(String, Option<String>)>,
 
-    window: Option<Window>,
+    window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
+    gui: Option<Gui>,
     adapter_luid: u64,
-    clip_tx: Option<Sender<String>>,
 
-    status: String,
-    session: Option<pb::SessionInfo>,
-    stream: Option<pb::StreamStarted>,
-    server_stats: Option<pb::ServerStats>,
-    current: Option<Arc<Slot>>,
-    cursors: HashMap<u32, CustomCursor>,
-    cursor_shape: u32,
-    cursor_visible: bool,
-    relative: bool,
+    launcher: LauncherState,
+    session: Option<Session>,
+    pending: Option<Pending>,
+    attempt: u64,
+    connect_task: Option<tokio::task::JoinHandle<()>>,
+    pair_reply: Option<std::sync::mpsc::Sender<Option<String>>>,
+    verify_link: Option<Box<Link>>,
+
     focused: bool,
-    overlay_on: bool,
-    game: bool,
     fullscreen: bool,
-    overlay_img: Option<OverlayImage>,
-    overlay_version: u64,
-    last_tick: Instant,
-    summary: Summary,
-    status_log: Instant,
-    last_rendered_total: u64,
+    toolbar_open: bool,
     mods: winit::keyboard::ModifiersState,
-    winit_keys: u64,
-    logged_keys: (u64, u64),
-    exit_message: Option<String>,
+    cursor_over_ui: bool,
+    /// Buttons pressed on the remote side (their releases must follow).
+    remote_buttons: u8,
+    repaint_at: Option<Instant>,
+    exit: bool,
 }
 
-fn ctl(m: Msg) -> NetCmd {
-    NetCmd::Control(pb::ControlMsg { msg: Some(m) })
+fn hwnd(window: &Window) -> Option<windows::Win32::Foundation::HWND> {
+    match window.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(h) => Some(windows::Win32::Foundation::HWND(h.hwnd.get() as *mut _)),
+        _ => None,
+    }
+}
+
+/// Device on the GPU that drives the monitor the window is on.
+fn device_for_window(window: &Window) -> anyhow::Result<D3dDevice> {
+    if let (Some(m), Ok(topo)) = (window.current_monitor(), Topology::enumerate()) {
+        if let Some(a) = topo.adapter_for_monitor(m.hmonitor()) {
+            if let Ok(d) = D3dDevice::for_adapter(&a.adapter) {
+                return Ok(d);
+            }
+        }
+    }
+    D3dDevice::default_adapter()
+}
+
+fn parse_codec(s: &str) -> pb::Codec {
+    match s.to_ascii_lowercase().as_str() {
+        "h264" | "avc" => pb::Codec::H264,
+        "hevc" | "h265" => pb::Codec::Hevc,
+        "av1" => pb::Codec::Av1,
+        _ => pb::Codec::Unspecified,
+    }
+}
+
+fn parse_chroma(s: &str) -> pb::Chroma {
+    match s {
+        "420" => pb::Chroma::Yuv420,
+        "444" => pb::Chroma::Yuv444,
+        _ => pb::Chroma::Unspecified,
+    }
+}
+
+fn start_request(d: &Defaults) -> pb::StartStream {
+    let game = d.mode.eq_ignore_ascii_case("game");
+    pb::StartStream {
+        display_id: d.display,
+        config: Some(pb::StreamConfig {
+            codec: parse_codec(&d.codec) as i32,
+            chroma: parse_chroma(&d.chroma) as i32,
+            width: 0,
+            height: 0,
+            fps: 0,
+            bitrate_kbps: d.bitrate_kbps,
+            mode: if game { pb::StreamMode::Game } else { pb::StreamMode::Office } as i32,
+        }),
+        encoder_preference: d.encoder.clone(),
+    }
 }
 
 impl App {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        startup: Startup,
-        ui: Ui,
-        net_tx: UnboundedSender<NetCmd>,
-        video_tx: Sender<VideoIn>,
-        hw_decode: bool,
-        host_label: String,
-        fullscreen: bool,
+        rt: tokio::runtime::Handle,
+        ui_tx: Ui,
+        data_dir: PathBuf,
+        cfg: ClientConfig,
+        identity: Identity,
+        auto_connect: Option<(String, Option<String>)>,
     ) -> Self {
-        let start = startup.params.start.clone();
-        let game = start.config.as_ref().is_some_and(|c| c.mode == pb::StreamMode::Game as i32);
         Self {
-            startup: Some(startup),
-            ui,
-            net_tx,
-            video_tx,
-            stats: Arc::new(Shared::new()),
-            store: Arc::new(FrameStore::default()),
-            hw_decode,
-            host_label,
-            start,
+            rt,
+            ui_tx,
+            data_dir,
+            cfg,
+            identity,
+            client_name: std::env::var("COMPUTERNAME").unwrap_or_else(|_| "nya-client".into()),
+            auto_connect,
             window: None,
             renderer: None,
+            gui: None,
             adapter_luid: 0,
-            clip_tx: None,
-            status: "连接中".into(),
+            launcher: LauncherState::default(),
             session: None,
-            stream: None,
-            server_stats: None,
-            current: None,
-            cursors: HashMap::new(),
-            cursor_shape: 0,
-            cursor_visible: true,
-            relative: false,
+            pending: None,
+            attempt: 0,
+            connect_task: None,
+            pair_reply: None,
+            verify_link: None,
             focused: false,
-            overlay_on: false,
-            game,
-            fullscreen,
-            overlay_img: None,
-            overlay_version: 0,
-            last_tick: Instant::now(),
-            summary: Summary::default(),
-            status_log: Instant::now(),
-            last_rendered_total: 0,
+            fullscreen: false,
+            toolbar_open: false,
             mods: Default::default(),
-            winit_keys: 0,
-            logged_keys: (0, 0),
-            exit_message: None,
+            cursor_over_ui: false,
+            remote_buttons: 0,
+            repaint_at: None,
+            exit: false,
         }
     }
 
-    pub fn exit_message(&self) -> Option<&str> {
-        self.exit_message.as_deref()
-    }
-
-    fn send_input(&self, ev: Ev) {
-        let _ = self.net_tx.send(NetCmd::Input(pb::InputMsg { ev: Some(ev) }));
-    }
-
-    fn hwnd(window: &Window) -> Option<windows::Win32::Foundation::HWND> {
-        match window.window_handle().ok()?.as_raw() {
-            RawWindowHandle::Win32(h) => Some(windows::Win32::Foundation::HWND(h.hwnd.get() as *mut _)),
-            _ => None,
+    fn request_redraw(&self) {
+        if let Some(w) = &self.window {
+            w.request_redraw();
         }
     }
 
-    /// Device on the GPU that drives the monitor the window is on.
-    fn device_for_window(window: &Window) -> anyhow::Result<D3dDevice> {
-        if let (Some(m), Ok(topo)) = (window.current_monitor(), Topology::enumerate()) {
-            if let Some(a) = topo.adapter_for_monitor(m.hmonitor()) {
-                if let Ok(d) = D3dDevice::for_adapter(&a.adapter) {
-                    return Ok(d);
-                }
-            }
-        }
-        D3dDevice::default_adapter()
-    }
+    // ------------------------------------------------------------------ devices
 
     fn create_renderer(&mut self, dev: D3dDevice) -> anyhow::Result<()> {
-        let window = self.window.as_ref().unwrap();
-        let hwnd = Self::hwnd(window).ok_or_else(|| anyhow::anyhow!("no HWND"))?;
+        let window = self.window.clone().unwrap();
+        let h = hwnd(&window).ok_or_else(|| anyhow::anyhow!("no HWND"))?;
         let size = window.inner_size();
         self.adapter_luid = dev.luid;
-        self.renderer = Some(Renderer::new(dev, hwnd, size.width, size.height)?);
+        match self.gui.as_mut() {
+            Some(g) => g.set_device(&dev)?,
+            None => self.gui = Some(Gui::new(&window, &dev)?),
+        }
+        self.renderer = Some(Renderer::new(dev, h, size.width, size.height)?);
         Ok(())
-    }
-
-    fn title(&self) -> String {
-        let mut t = format!("{} — NyaRemoteControl", self.host_label);
-        if let Some(s) = &self.stream {
-            let c = s.config.clone().unwrap_or_default();
-            let chroma = if c.chroma == pb::Chroma::Yuv444 as i32 { "4:4:4" } else { "4:2:0" };
-            t += &format!(" — {}x{}@{} {} {} {} kbps", c.width, c.height, self.summary.fps, s.encoder_name, chroma, self.summary.kbps);
-        }
-        if !self.status.is_empty() {
-            t += &format!(" — {}", self.status);
-        }
-        if !input::grabbed() {
-            t += " [键盘未捕获 Ctrl+Alt+Shift+Q]";
-        }
-        t
-    }
-
-    fn overlay_text(&self) -> String {
-        let s = &self.summary;
-        let mut lines = vec![format!("{}  {}", self.host_label, self.status)];
-        if let Some(st) = &self.stream {
-            let c = st.config.clone().unwrap_or_default();
-            lines.push(format!(
-                "编码 {} {} {}x{}@{}  {}{}",
-                st.encoder_name,
-                if c.chroma == pb::Chroma::Yuv444 as i32 { "4:4:4" } else { "4:2:0" },
-                c.width,
-                c.height,
-                c.fps,
-                if c.mode == pb::StreamMode::Game as i32 { "游戏模式" } else { "办公模式" },
-                if st.cross_gpu { format!("  跨显卡 [{}]→[{}]", st.capture_gpu_index, st.encode_gpu_index) } else { String::new() }
-            ));
-        }
-        let (sfps, skbps, enc_ms, xfer_ms) = self
-            .server_stats
-            .as_ref()
-            .map(|x| (x.fps, x.bitrate_kbps, x.encode_ms_p50, x.transfer_ms_p50))
-            .unwrap_or_default();
-        lines.push(format!("帧率 被控端 {sfps} / 本机 {}  丢帧 {}  码率 {:.1} Mbps", s.fps, s.dropped, skbps.max(s.kbps) as f32 / 1000.0));
-        lines.push(format!("延迟 端到端 {:.1} ms  RTT {:.1} ms", s.latency_ms, s.rtt_ms));
-        lines.push(format!(
-            "耗时 编码 {enc_ms:.1} ms  跨显卡 {xfer_ms:.1} ms  解码 {:.1} ms  渲染 {:.1} ms",
-            s.decode_ms, s.render_ms
-        ));
-        lines.push(format!(
-            "解码器 {}  鼠标 {}  键盘 {}",
-            s.decoder,
-            if self.relative { "相对" } else { "绝对" },
-            if input::grabbed() { "已捕获" } else { "未捕获" }
-        ));
-        lines.push("Ctrl+Alt+Shift: Q 键盘 S 统计 M 模式 R 相对鼠标 F 全屏 D Ctrl+Alt+Del 1-9 显示器 X 退出".into());
-        lines.join("\n")
-    }
-
-    fn refresh_overlay(&mut self) {
-        if self.overlay_on {
-            self.overlay_version += 1;
-            self.overlay_img = Some(overlay::render_text(&self.overlay_text(), self.overlay_version));
-        }
-    }
-
-    fn draw(&mut self) {
-        let (slot, fresh) = self.store.take();
-        if slot.is_some() {
-            self.current = slot;
-        }
-        let Some(r) = self.renderer.as_mut() else { return };
-        let overlay = if self.overlay_on { self.overlay_img.as_ref() } else { None };
-        let t = Instant::now();
-        if let Err(e) = r.render(self.current.as_deref(), overlay, self.game) {
-            tracing::warn!("render failed ({e:#}); recreating device");
-            self.recreate_device();
-            return;
-        }
-        let render_ms = t.elapsed().as_secs_f32() * 1000.0;
-        if fresh && self.stats.with(|s| s.total_rendered == 0) {
-            tracing::info!("first frame rendered ({:.1} ms)", render_ms);
-        }
-        if fresh {
-            self.stats.with(|s| s.total_rendered += 1);
-        }
-        if fresh {
-            let lat = self.current.as_ref().map(|s| self.stats.latency_ms(s.capture_ts));
-            self.stats.with(|s| {
-                s.render_ms.push(render_ms);
-                s.frames_rendered += 1;
-                if let Some(l) = lat {
-                    s.latency_ms.push(l);
-                }
-            });
-        }
     }
 
     fn recreate_device(&mut self) {
         self.renderer = None;
-        self.current = None;
-        let Some(w) = self.window.as_ref() else { return };
-        match Self::device_for_window(w) {
+        let Some(w) = self.window.clone() else { return };
+        match device_for_window(&w) {
             Ok(dev) => {
-                let _ = self.video_tx.send(VideoIn::Device(dev.clone()));
+                if let Some(s) = &mut self.session {
+                    s.current = None;
+                    s.set_device(&dev);
+                }
                 if let Err(e) = self.create_renderer(dev) {
                     tracing::error!("renderer: {e:#}");
                 }
@@ -281,16 +196,382 @@ impl App {
         }
     }
 
-    fn video_size(&self) -> Option<(u32, u32)> {
-        if let Some(s) = &self.current {
-            return Some((s.width, s.height));
+    // --------------------------------------------------------------- connecting
+
+    fn connect(&mut self, target: String, name: Option<String>) {
+        let entry = self.cfg.find(&target).cloned();
+        let address = entry.as_ref().map(|e| e.address.clone()).unwrap_or(target);
+        let label = name.or_else(|| entry.as_ref().map(|e| e.name.clone()));
+        self.start_connect(Pending { address, label, reverify: false });
+    }
+
+    fn start_connect(&mut self, p: Pending) {
+        let pinned = if p.reverify {
+            None
+        } else {
+            self.cfg
+                .hosts
+                .iter()
+                .find(|h| h.address == p.address)
+                .and_then(|h| Fingerprint::from_hex(&h.fingerprint))
+        };
+        self.attempt += 1;
+        let attempt = self.attempt;
+        let (id, name, ui, address) = (self.identity.clone(), self.client_name.clone(), self.ui_tx.clone(), p.address.clone());
+        let ui2 = ui.clone();
+        let prompt: PairPrompt = Arc::new(move || {
+            let (tx, rx) = std::sync::mpsc::channel();
+            ui2.send(UiEvent::NeedPairing(tx));
+            rx.recv().ok().flatten()
+        });
+        let task = self.rt.spawn(async move {
+            let res = async {
+                let addr = nya_transport::endpoint::resolve(&address, nya_proto::DEFAULT_PORT)?;
+                net::connect(addr, &id, pinned, &name, Some(prompt)).await
+            }
+            .await;
+            let (result, pin_mismatch) = match res {
+                Ok(l) => (Ok(Box::new(l)), false),
+                Err(e) => {
+                    let m = format!("{e:#}");
+                    let pm = pinned.is_some() && m.contains(nya_transport::tls::PIN_MISMATCH);
+                    (Err(m), pm)
+                }
+            };
+            ui.send(UiEvent::ConnectDone(ConnectDone { attempt, result, pin_mismatch }));
+        });
+        self.launcher.connecting = Some(p.label.clone().unwrap_or_else(|| p.address.clone()));
+        self.launcher.notice = None;
+        self.pending = Some(p);
+        self.connect_task = Some(task);
+        self.request_redraw();
+    }
+
+    fn cancel_connect(&mut self) {
+        if let Some(t) = self.connect_task.take() {
+            t.abort();
         }
-        let c = self.stream.as_ref()?.config.clone()?;
-        Some((c.width, c.height))
+        if let Some(tx) = self.pair_reply.take() {
+            let _ = tx.send(None);
+        }
+        self.pending = None;
+        self.verify_link = None;
+        self.launcher.connecting = None;
+        self.launcher.pairing = None;
+        self.launcher.pin_changed = false;
+        self.launcher.verify_fingerprint = None;
+    }
+
+    fn on_connect_done(&mut self, done: ConnectDone) {
+        if done.attempt != self.attempt || self.pending.is_none() {
+            return; // cancelled
+        }
+        self.connect_task = None;
+        self.launcher.connecting = None;
+        self.launcher.pairing = None;
+        match done.result {
+            Ok(link) => {
+                let reverify = self.pending.as_ref().is_some_and(|p| p.reverify);
+                if reverify && !link.welcome.needs_pairing {
+                    self.launcher.verify_fingerprint = Some(link.server_fp.to_string());
+                    self.verify_link = Some(link);
+                } else {
+                    self.finish_connect(link);
+                }
+            }
+            Err(msg) if done.pin_mismatch => {
+                tracing::warn!("{msg}");
+                self.launcher.pin_changed = true;
+            }
+            Err(msg) => {
+                self.pending = None;
+                self.launcher.notice = Some(Notice::Error(msg));
+            }
+        }
+    }
+
+    fn finish_connect(&mut self, link: Box<Link>) {
+        let Some(p) = self.pending.take() else { return };
+        let label = p.label.unwrap_or_else(|| link.welcome.server_name.clone());
+        self.cfg.upsert(HostEntry { name: label.clone(), address: p.address, fingerprint: link.server_fp.to_hex() });
+        if let Err(e) = self.cfg.save(&self.data_dir) {
+            tracing::warn!("save config: {e:#}");
+        }
+        let Some(dev) = self.renderer.as_ref().map(|r| r.dev.clone()) else { return };
+        let d = self.cfg.defaults.clone();
+        let monitor_fps = self
+            .window
+            .as_ref()
+            .and_then(|w| w.current_monitor())
+            .and_then(|m| m.refresh_rate_millihertz())
+            .map(|mhz| mhz.div_ceil(1000))
+            .unwrap_or(60);
+        let caps = caps::detect(&dev, d.hw_decode, if d.max_fps > 0 { d.max_fps } else { monitor_fps });
+        tracing::info!("decoders: {:?}", caps.decoders.iter().map(|c| (c.codec, c.chroma, c.hardware)).collect::<Vec<_>>());
+        let params = Params {
+            addr: link.conn.remote_address(),
+            pinned: link.server_fp,
+            identity: self.identity.clone(),
+            name: self.client_name.clone(),
+            caps,
+            start: start_request(&d),
+        };
+        let opts = SessionOptions { hw_decode: d.hw_decode, audio: d.audio, clipboard: d.clipboard };
+        self.session = Some(Session::start(&self.rt, *link, params, &dev, &opts, self.ui_tx.clone(), label));
+        self.toolbar_open = false;
+        self.launcher.notice = None;
+        if d.fullscreen {
+            self.set_fullscreen(true);
+        }
+        self.update_no_hotkeys();
+        self.update_title();
+    }
+
+    fn end_session(&mut self, message: Option<Notice>) {
+        let Some(s) = self.session.take() else { return };
+        s.quit();
+        drop(s);
+        self.set_fullscreen(false);
+        if let Some(w) = &self.window {
+            let _ = w.set_cursor_grab(CursorGrabMode::None);
+            w.set_cursor(CursorIcon::Default);
+            w.set_cursor_visible(true);
+        }
+        self.remote_buttons = 0;
+        self.launcher.notice = message;
+        self.update_no_hotkeys();
+        self.update_title();
+        self.request_redraw();
+    }
+
+    // ------------------------------------------------------------------ session
+
+    fn set_fullscreen(&mut self, on: bool) {
+        self.fullscreen = on;
+        if let Some(w) = &self.window {
+            w.set_fullscreen(on.then(|| Fullscreen::Borderless(None)));
+        }
+    }
+
+    fn set_relative(&mut self, on: bool) {
+        let Some(s) = self.session.as_mut() else { return };
+        s.relative = on;
+        if let Some(w) = &self.window {
+            if on {
+                let _ = w.set_cursor_grab(CursorGrabMode::Confined).or_else(|_| w.set_cursor_grab(CursorGrabMode::Locked));
+                w.set_cursor_visible(false);
+            } else {
+                let _ = w.set_cursor_grab(CursorGrabMode::None);
+                w.set_cursor_visible(s.cursor_visible);
+            }
+        }
+    }
+
+    /// While focused and grabbed, keep shell hotkeys (Win+D, …) from acting locally.
+    fn update_no_hotkeys(&self) {
+        if let Some(h) = self.window.as_ref().and_then(|w| hwnd(w)) {
+            input::set_no_hotkeys(h, self.focused && input::grabbed() && self.session.is_some());
+        }
+    }
+
+    fn update_title(&self) {
+        let Some(w) = &self.window else { return };
+        let t = match &self.session {
+            None => "NyaRemoteControl".to_string(),
+            Some(s) => {
+                let mut t = format!("{} — NyaRemoteControl", s.label);
+                if let Some(st) = &s.stream {
+                    let c = st.config.clone().unwrap_or_default();
+                    t += &format!(" — {}x{}@{} {} {} kbps", c.width, c.height, s.summary.fps, st.encoder_name, s.summary.kbps);
+                }
+                if !input::grabbed() {
+                    t += " [键盘未捕获]";
+                }
+                t
+            }
+        };
+        w.set_title(&t);
+    }
+
+    fn hotkey(&mut self, h: Hotkey) {
+        tracing::info!("hotkey {h:?}");
+        if self.session.is_none() {
+            return;
+        }
+        match h {
+            Hotkey::ToggleGrab => self.set_grab(!input::grabbed()),
+            Hotkey::ToggleStats => {
+                if let Some(s) = &mut self.session {
+                    s.show_stats = !s.show_stats;
+                }
+            }
+            Hotkey::ToggleMode => {
+                if let Some(s) = &mut self.session {
+                    let g = !s.game;
+                    s.set_game_mode(g);
+                }
+            }
+            Hotkey::ToggleRelative => {
+                let on = !self.session.as_ref().is_some_and(|s| s.relative);
+                self.set_relative(on);
+            }
+            Hotkey::ToggleFullscreen => self.set_fullscreen(!self.fullscreen),
+            Hotkey::CtrlAltDel => {
+                if let Some(s) = &self.session {
+                    s.ctrl_alt_del();
+                }
+            }
+            Hotkey::ToggleToolbar => self.toolbar_open = !self.toolbar_open,
+            Hotkey::Display(n) => {
+                if let Some(s) = &mut self.session {
+                    s.select_display_index(n);
+                }
+            }
+            Hotkey::Quit => self.end_session(Some(Notice::Info("已断开连接".into()))),
+        }
+        self.update_title();
+        self.request_redraw();
+    }
+
+    fn set_grab(&mut self, on: bool) {
+        input::set_grab(on);
+        if !on {
+            if let Some(s) = &self.session {
+                s.release_all();
+            }
+        }
+        self.update_no_hotkeys();
+        self.update_title();
+    }
+
+    fn apply(&mut self, actions: Vec<Action>) {
+        for a in actions {
+            match a {
+                Action::Connect { target, name } => self.connect(target, name),
+                Action::CancelConnect => self.cancel_connect(),
+                Action::PairCode(code) => {
+                    self.launcher.pairing = None;
+                    if let Some(tx) = self.pair_reply.take() {
+                        let _ = tx.send(code);
+                    }
+                }
+                Action::PinChanged(yes) => {
+                    self.launcher.pin_changed = false;
+                    match self.pending.take() {
+                        Some(mut p) if yes => {
+                            p.reverify = true;
+                            self.start_connect(p);
+                        }
+                        _ => self.pending = None,
+                    }
+                }
+                Action::FingerprintOk(yes) => {
+                    self.launcher.verify_fingerprint = None;
+                    match self.verify_link.take() {
+                        Some(link) if yes => self.finish_connect(link),
+                        _ => {
+                            self.pending = None;
+                            self.launcher.notice = Some(Notice::Error("证书指纹未确认，已取消连接".into()));
+                        }
+                    }
+                }
+                Action::DeleteHost(i) => {
+                    if i < self.cfg.hosts.len() {
+                        self.cfg.hosts.remove(i);
+                        let _ = self.cfg.save(&self.data_dir);
+                    }
+                }
+                Action::SaveConfig => {
+                    if let Err(e) = self.cfg.save(&self.data_dir) {
+                        self.launcher.notice = Some(Notice::Error(format!("保存失败：{e:#}")));
+                    }
+                }
+                Action::Hotkey(h) => self.hotkey(h),
+                Action::SetGameMode(g) => {
+                    if let Some(s) = &mut self.session {
+                        s.set_game_mode(g);
+                    }
+                }
+                Action::SelectDisplay(id) => {
+                    if let Some(s) = &mut self.session {
+                        s.select_display(id);
+                    }
+                }
+                Action::SetGrab(on) => self.set_grab(on),
+                Action::Disconnect => self.end_session(Some(Notice::Info("已断开连接".into()))),
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ drawing
+
+    fn draw(&mut self) {
+        let Some(window) = self.window.clone() else { return };
+        let Some(mut gui) = self.gui.take() else { return };
+        let mut actions = Vec::new();
+        let (toolbar_open, fullscreen) = (self.toolbar_open, self.fullscreen);
+        let (session, launcher, cfg) = (&mut self.session, &mut self.launcher, &mut self.cfg);
+        let frame = gui.run(&window, |ctx| match session.as_mut() {
+            Some(s) => ui::session_overlay(ctx, s, toolbar_open, fullscreen, &mut actions),
+            None => ui::launcher(ctx, launcher, cfg, &mut actions),
+        });
+
+        let mut fresh = false;
+        if let Some(s) = &mut self.session {
+            let (slot, f) = s.store.take();
+            if slot.is_some() {
+                s.current = slot;
+            }
+            fresh = f;
+        }
+        let game = self.session.as_ref().is_some_and(|s| s.game);
+        let t = Instant::now();
+        let mut failed = false;
+        if let Some(r) = self.renderer.as_mut() {
+            let res = (|| -> anyhow::Result<()> {
+                let rtv = r.begin()?;
+                if let Some(slot) = self.session.as_ref().and_then(|s| s.current.clone()) {
+                    r.draw_video(&slot);
+                }
+                gui.paint(&rtv, (r.width, r.height), &frame)?;
+                r.present(game)
+            })();
+            if let Err(e) = res {
+                tracing::warn!("render failed ({e:#}); recreating device");
+                failed = true;
+            }
+        }
+        self.gui = Some(gui);
+        if failed {
+            self.recreate_device();
+        }
+
+        if fresh {
+            if let Some(s) = &self.session {
+                let render_ms = t.elapsed().as_secs_f32() * 1000.0;
+                let lat = s.current.as_ref().map(|c| s.stats.latency_ms(c.capture_ts));
+                s.stats.with(|st| {
+                    if st.total_rendered == 0 {
+                        tracing::info!("first frame rendered ({render_ms:.1} ms)");
+                    }
+                    st.total_rendered += 1;
+                    st.render_ms.push(render_ms);
+                    st.frames_rendered += 1;
+                    if let Some(l) = lat {
+                        st.latency_ms.push(l);
+                    }
+                });
+            }
+        }
+        self.repaint_at = (frame.repaint_after < Duration::from_secs(1)).then(|| Instant::now() + frame.repaint_after);
+        if !actions.is_empty() {
+            self.apply(actions);
+            self.request_redraw();
+        }
     }
 
     fn map_mouse(&self, x: f64, y: f64) -> Option<(u32, u32)> {
-        let (vw, vh) = self.video_size()?;
+        let (vw, vh) = self.session.as_ref()?.video_size()?;
         let r = self.renderer.as_ref()?;
         let rect = fit(r.width, r.height, vw, vh);
         let nx = ((x - rect.x) / rect.w).clamp(0.0, 1.0);
@@ -298,107 +579,55 @@ impl App {
         Some(((nx * 65535.0).round() as u32, (ny * 65535.0).round() as u32))
     }
 
-    fn set_relative(&mut self, on: bool) {
-        self.relative = on;
-        if let Some(w) = &self.window {
-            if on {
-                let _ = w.set_cursor_grab(CursorGrabMode::Confined).or_else(|_| w.set_cursor_grab(CursorGrabMode::Locked));
-                w.set_cursor_visible(false);
-            } else {
-                let _ = w.set_cursor_grab(CursorGrabMode::None);
-                w.set_cursor_visible(self.cursor_visible);
-            }
+    /// Switch between the remote cursor and a normal arrow over the toolbar.
+    fn update_cursor_over_ui(&mut self, over: bool) {
+        if over == self.cursor_over_ui {
+            return;
         }
-    }
-
-    /// While focused and grabbed, keep shell hotkeys (Win+D, …) from acting locally.
-    fn update_no_hotkeys(&self) {
-        if let Some(h) = self.window.as_ref().and_then(Self::hwnd) {
-            input::set_no_hotkeys(h, self.focused && input::grabbed() && input::active());
+        self.cursor_over_ui = over;
+        let (Some(w), Some(s)) = (&self.window, &self.session) else { return };
+        if over {
+            w.set_cursor(CursorIcon::Default);
+            w.set_cursor_visible(true);
+        } else if !s.relative {
+            if let Some(c) = s.cursors.get(&s.cursor_shape) {
+                w.set_cursor(c.clone());
+            }
+            w.set_cursor_visible(s.cursor_visible);
         }
-    }
-
-    fn hotkey(&mut self, el: &ActiveEventLoop, h: Hotkey) {
-        tracing::info!("hotkey {h:?}");
-        match h {
-            Hotkey::ToggleGrab => {
-                input::set_grab(!input::grabbed());
-                self.update_no_hotkeys();
-                if !input::grabbed() {
-                    self.send_input(Ev::ReleaseAll(pb::ReleaseAll {}));
-                }
-            }
-            Hotkey::ToggleStats => {
-                self.overlay_on = !self.overlay_on;
-                self.refresh_overlay();
-                self.draw();
-            }
-            Hotkey::ToggleMode => {
-                self.game = !self.game;
-                let mode = if self.game { pb::StreamMode::Game } else { pb::StreamMode::Office } as i32;
-                self.start.config.get_or_insert_with(Default::default).mode = mode;
-                let _ = self.net_tx.send(ctl(Msg::SetMode(pb::SetMode { mode })));
-                self.status = if self.game { "切换到游戏模式" } else { "切换到办公模式" }.into();
-            }
-            Hotkey::ToggleRelative => self.set_relative(!self.relative),
-            Hotkey::ToggleFullscreen => {
-                self.fullscreen = !self.fullscreen;
-                if let Some(w) = &self.window {
-                    w.set_fullscreen(self.fullscreen.then(|| Fullscreen::Borderless(None)));
-                }
-            }
-            Hotkey::CtrlAltDel => {
-                let _ = self.net_tx.send(ctl(Msg::SendSas(pb::SendSas {})));
-            }
-            Hotkey::Display(n) => {
-                let id = self.session.as_ref().and_then(|s| s.displays.get(n as usize - 1)).map(|d| d.id);
-                if let Some(id) = id {
-                    self.start.display_id = id;
-                    let _ = self.net_tx.send(ctl(Msg::StartStream(self.start.clone())));
-                    self.status = format!("切换到显示器 {n}");
-                }
-            }
-            Hotkey::Quit => self.quit(el, None),
-        }
-        if let Some(w) = &self.window {
-            w.set_title(&self.title());
-        }
-    }
-
-    fn quit(&mut self, el: &ActiveEventLoop, msg: Option<String>) {
-        let _ = self.net_tx.send(NetCmd::Quit);
-        self.exit_message = msg;
-        el.exit();
     }
 
     fn on_cursor(&mut self, el: &ActiveEventLoop, m: pb::CursorMsg) {
+        let Some(s) = self.session.as_mut() else { return };
         match m.msg {
-            Some(cursor_msg::Msg::Shape(s)) => {
+            Some(cursor_msg::Msg::Shape(sh)) => {
                 let src = CustomCursor::from_rgba(
-                    s.rgba,
-                    s.width.min(u16::MAX as u32) as u16,
-                    s.height.min(u16::MAX as u32) as u16,
-                    s.hot_x.clamp(0, s.width as i32 - 1) as u16,
-                    s.hot_y.clamp(0, s.height as i32 - 1) as u16,
+                    sh.rgba,
+                    sh.width.min(u16::MAX as u32) as u16,
+                    sh.height.min(u16::MAX as u32) as u16,
+                    sh.hot_x.clamp(0, sh.width as i32 - 1) as u16,
+                    sh.hot_y.clamp(0, sh.height as i32 - 1) as u16,
                 );
                 match src {
                     Ok(src) => {
-                        self.cursors.insert(s.id, el.create_custom_cursor(src));
+                        s.cursors.insert(sh.id, el.create_custom_cursor(src));
                     }
                     Err(e) => tracing::debug!("cursor shape: {e}"),
                 }
             }
             Some(cursor_msg::Msg::State(st)) => {
                 let Some(w) = &self.window else { return };
-                if st.shape_id != self.cursor_shape {
-                    if let Some(c) = self.cursors.get(&st.shape_id) {
-                        w.set_cursor(c.clone());
-                        self.cursor_shape = st.shape_id;
+                if st.shape_id != s.cursor_shape {
+                    if let Some(c) = s.cursors.get(&st.shape_id) {
+                        if !self.cursor_over_ui {
+                            w.set_cursor(c.clone());
+                        }
+                        s.cursor_shape = st.shape_id;
                     }
                 }
-                if st.visible != self.cursor_visible {
-                    self.cursor_visible = st.visible;
-                    if !self.relative {
+                if st.visible != s.cursor_visible {
+                    s.cursor_visible = st.visible;
+                    if !s.relative && !self.cursor_over_ui {
                         w.set_cursor_visible(st.visible);
                     }
                 }
@@ -407,113 +636,167 @@ impl App {
         }
     }
 
-    fn tick(&mut self) {
-        let secs = self.last_tick.elapsed().as_secs_f32();
-        if secs < 1.0 {
-            return;
+    fn hotkey_from_key(&self, event: &winit::event::KeyEvent) -> Option<Hotkey> {
+        use winit::keyboard::{KeyCode, PhysicalKey};
+        let m = self.mods;
+        if event.state != ElementState::Pressed || !(m.control_key() && m.alt_key() && m.shift_key()) {
+            return None;
         }
-        if self.stream.is_some() && self.status_log.elapsed() >= Duration::from_secs(5) {
-            self.status_log = Instant::now();
-            let (f, b, d, r) = self.stats.with(|s| (s.total_rx_frames, s.total_rx_bytes, s.total_decoded, s.total_rendered));
-            if r == self.last_rendered_total {
-                tracing::warn!("no new picture in 5 s: received {f} frames / {} KB, decoded {d}, rendered {r}", b / 1024);
+        let PhysicalKey::Code(c) = event.physical_key else { return None };
+        Some(match c {
+            KeyCode::KeyQ => Hotkey::ToggleGrab,
+            KeyCode::KeyS => Hotkey::ToggleStats,
+            KeyCode::KeyM => Hotkey::ToggleMode,
+            KeyCode::KeyR => Hotkey::ToggleRelative,
+            KeyCode::KeyF => Hotkey::ToggleFullscreen,
+            KeyCode::KeyD => Hotkey::CtrlAltDel,
+            KeyCode::KeyT => Hotkey::ToggleToolbar,
+            KeyCode::KeyX => Hotkey::Quit,
+            KeyCode::Digit1 => Hotkey::Display(1),
+            KeyCode::Digit2 => Hotkey::Display(2),
+            KeyCode::Digit3 => Hotkey::Display(3),
+            KeyCode::Digit4 => Hotkey::Display(4),
+            _ => return None,
+        })
+    }
+
+    /// Mouse / keyboard events while a session is active.
+    fn session_input(&mut self, event: &WindowEvent) {
+        let over_ui = self.gui.as_ref().is_some_and(|g| g.ctx.is_pointer_over_area() || g.ctx.is_using_pointer());
+        match event {
+            WindowEvent::CursorMoved { position, .. } => {
+                self.update_cursor_over_ui(over_ui);
+                let relative = self.session.as_ref().is_some_and(|s| s.relative);
+                if !over_ui && !relative && self.focused {
+                    if let Some((x, y)) = self.map_mouse(position.x, position.y) {
+                        if let Some(s) = &self.session {
+                            s.send_input(Ev::MouseAbs(pb::MouseAbs { x, y }));
+                        }
+                    }
+                }
+                // Keep the toolbar handle responsive near the top edge.
+                if position.y < 60.0 || over_ui {
+                    self.request_redraw();
+                }
             }
-            self.last_rendered_total = r;
-            let keys = (input::hook_key_count(), self.winit_keys);
-            if keys != self.logged_keys {
-                tracing::info!(
-                    "keys so far: hook {} (hook calls {}) / window {} (grab {})",
-                    keys.0,
-                    input::hook_call_count(),
-                    keys.1,
-                    input::grabbed()
-                );
-                self.logged_keys = keys;
+            WindowEvent::MouseInput { state, button, .. } => {
+                let (b, bit) = match button {
+                    MouseButton::Left => (pb::MouseButton::Left, 1),
+                    MouseButton::Right => (pb::MouseButton::Right, 2),
+                    MouseButton::Middle => (pb::MouseButton::Middle, 4),
+                    MouseButton::Back => (pb::MouseButton::X1, 8),
+                    MouseButton::Forward => (pb::MouseButton::X2, 16),
+                    MouseButton::Other(_) => return,
+                };
+                let down = *state == ElementState::Pressed;
+                // Presses on the toolbar stay local; a release always follows its press.
+                let forward = if down { !over_ui } else { self.remote_buttons & bit != 0 };
+                if forward {
+                    if down {
+                        self.remote_buttons |= bit;
+                    } else {
+                        self.remote_buttons &= !bit;
+                    }
+                    if let Some(s) = &self.session {
+                        s.send_input(Ev::MouseButton(pb::MouseButtonEv { button: b as i32, down }));
+                    }
+                }
             }
-        }
-        self.last_tick = Instant::now();
-        self.summary = self.stats.take_summary(secs);
-        let s = &self.summary;
-        let _ = self.net_tx.send(ctl(Msg::ClientStats(pb::ClientStats {
-            decode_ms_p50: s.decode_ms,
-            render_ms_p50: s.render_ms,
-            frames_dropped: s.dropped,
-            fps: s.fps,
-        })));
-        if let Some(w) = &self.window {
-            w.set_title(&self.title());
-        }
-        if self.overlay_on {
-            self.refresh_overlay();
-            self.draw();
+            WindowEvent::MouseWheel { delta, .. } if !over_ui => {
+                let (dx, dy) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => ((x * 120.0) as i32, (y * 120.0) as i32),
+                    MouseScrollDelta::PixelDelta(p) => (p.x as i32, p.y as i32),
+                };
+                if dx != 0 || dy != 0 {
+                    if let Some(s) = &self.session {
+                        s.send_input(Ev::Wheel(pb::Wheel { dx, dy }));
+                    }
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let Some(s) = &mut self.session {
+                    s.winit_keys += 1;
+                }
+                if let Some(h) = self.hotkey_from_key(event) {
+                    self.hotkey(h);
+                    return;
+                }
+                // Keys the hook forwarded were swallowed and never reach the window, so
+                // anything arriving here still has to go to the host (cloud desktops
+                // deliver no keys to low-level hooks at all).
+                if input::grabbed() && self.focused {
+                    use winit::platform::scancode::PhysicalKeyExtScancode;
+                    if let (Some(sc), Some(s)) = (event.physical_key.to_scancode(), &self.session) {
+                        let (scancode, extended) = (sc & 0xff, sc & 0xff00 == 0xe000);
+                        if scancode != 0 {
+                            s.send_input(Ev::Key(pb::Key { scancode, extended, down: event.state == ElementState::Pressed }));
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }
 
 impl ApplicationHandler<UiEvent> for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
-        let Some(st) = self.startup.take() else { return };
-        let attrs = Window::default_attributes()
-            .with_title(format!("{} — NyaRemoteControl", self.host_label))
-            .with_inner_size(PhysicalSize::new(1600u32, 900u32))
-            .with_fullscreen(self.fullscreen.then(|| Fullscreen::Borderless(None)));
+        if self.window.is_some() {
+            return;
+        }
+        let attrs = Window::default_attributes().with_title("NyaRemoteControl").with_inner_size(LogicalSize::new(1100.0, 760.0));
         let window = match el.create_window(attrs) {
-            Ok(w) => w,
-            Err(e) => return self.quit(el, Some(format!("无法创建窗口：{e}"))),
+            Ok(w) => Arc::new(w),
+            Err(e) => {
+                crate::fatal(&format!("无法创建窗口：{e}"));
+                el.exit();
+                return;
+            }
         };
-        let hwnd = Self::hwnd(&window);
-        let dev = match Self::device_for_window(&window) {
+        self.window = Some(window.clone());
+        let dev = match device_for_window(&window) {
             Ok(d) => d,
-            Err(e) => return self.quit(el, Some(format!("无法创建 D3D11 设备：{e:#}"))),
+            Err(e) => {
+                crate::fatal(&format!("无法创建 D3D11 设备：{e:#}"));
+                el.exit();
+                return;
+            }
         };
-        let monitor_fps = window
-            .current_monitor()
-            .and_then(|m| m.refresh_rate_millihertz())
-            .map(|mhz| mhz.div_ceil(1000))
-            .unwrap_or(60);
-        self.window = Some(window);
-        if let Err(e) = self.create_renderer(dev.clone()) {
-            return self.quit(el, Some(format!("无法初始化渲染：{e:#}")));
+        if let Err(e) = self.create_renderer(dev) {
+            crate::fatal(&format!("无法初始化渲染：{e:#}"));
+            el.exit();
+            return;
         }
         tracing::info!("renderer on adapter luid {:#x}", self.adapter_luid);
-        // Paint black right away instead of leaving the window uninitialised.
+        if let Some(h) = hwnd(&window) {
+            input::install(h, self.ui_tx.clone());
+        }
+        if let Some((target, name)) = self.auto_connect.take() {
+            self.connect(target, name);
+        }
         self.draw();
-
-        let max_fps = if st.max_fps > 0 { st.max_fps } else { monitor_fps };
-        let caps = caps::detect(&dev, self.hw_decode, max_fps);
-        tracing::info!("decoders: {:?}", caps.decoders.iter().map(|d| (d.codec, d.chroma, d.hardware)).collect::<Vec<_>>());
-
-        VideoThread {
-            hw_allowed: self.hw_decode,
-            caps: caps.clone(),
-            store: self.store.clone(),
-            ui: self.ui.clone(),
-            net: self.net_tx.clone(),
-            stats: self.stats.clone(),
-        }
-        .spawn(dev, st.video_rx);
-        if st.audio {
-            crate::audio::spawn(st.audio_rx);
-        }
-        if st.clipboard {
-            let (tx, rx) = crossbeam_channel::unbounded();
-            crate::clipboard::spawn(rx, self.net_tx.clone());
-            self.clip_tx = Some(tx);
-        }
-        if let Some(h) = hwnd {
-            input::install(h, self.net_tx.clone(), self.ui.clone());
-            input::set_active(true);
-        }
-
-        let mut params = st.params;
-        params.caps = caps;
-        let sinks = Sinks { ui: self.ui.clone(), video: self.video_tx.clone(), audio: st.audio_tx, stats: self.stats.clone() };
-        st.runtime.spawn(net::supervise(st.link, params, st.net_rx, sinks));
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        match event {
-            WindowEvent::CloseRequested => self.quit(el, None),
+        let Some(window) = self.window.clone() else { return };
+        // Keyboard goes to egui only in the launcher (in a session it belongs to the host).
+        let keyboard = matches!(event, WindowEvent::KeyboardInput { .. } | WindowEvent::ModifiersChanged(_) | WindowEvent::Ime(_));
+        if self.session.is_none() || !keyboard {
+            if let Some(g) = self.gui.as_mut() {
+                let r = g.on_event(&window, &event);
+                if r.repaint && self.session.is_none() {
+                    window.request_redraw();
+                }
+            }
+        }
+        match &event {
+            WindowEvent::CloseRequested => {
+                if let Some(s) = &self.session {
+                    s.quit();
+                }
+                self.exit = true;
+                el.exit();
+            }
             WindowEvent::Resized(size) => {
                 if let Some(r) = self.renderer.as_mut() {
                     if let Err(e) = r.resize(size.width, size.height) {
@@ -524,168 +807,118 @@ impl ApplicationHandler<UiEvent> for App {
             }
             WindowEvent::RedrawRequested => self.draw(),
             WindowEvent::Focused(f) => {
-                self.focused = f;
+                self.focused = *f;
                 self.update_no_hotkeys();
-                if !f {
+                if !*f {
                     input::reset_modifiers();
-                    self.send_input(Ev::ReleaseAll(pb::ReleaseAll {}));
-                    if self.relative {
+                    if let Some(s) = &self.session {
+                        s.release_all();
+                    }
+                    self.remote_buttons = 0;
+                    if self.session.as_ref().is_some_and(|s| s.relative) {
                         self.set_relative(false);
                     }
                 }
             }
+            WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::Moved(_) => {
                 // Moving to a monitor on another GPU: follow it (design doc §3.5, client side).
-                if let Some(w) = &self.window {
-                    if let (Some(m), Ok(topo)) = (w.current_monitor(), Topology::enumerate()) {
-                        if let Some(a) = topo.adapter_for_monitor(m.hmonitor()) {
-                            if a.luid != self.adapter_luid && self.adapter_luid != 0 {
-                                tracing::info!("window moved to GPU {}; recreating device", a.name);
-                                self.recreate_device();
-                            }
+                if let (Some(m), Ok(topo)) = (window.current_monitor(), Topology::enumerate()) {
+                    if let Some(a) = topo.adapter_for_monitor(m.hmonitor()) {
+                        if a.luid != self.adapter_luid && self.adapter_luid != 0 {
+                            tracing::info!("window moved to GPU {}; recreating device", a.name);
+                            self.recreate_device();
                         }
                     }
-                }
-            }
-            WindowEvent::CursorMoved { position, .. } => {
-                if !self.relative && self.focused {
-                    if let Some((x, y)) = self.map_mouse(position.x, position.y) {
-                        self.send_input(Ev::MouseAbs(pb::MouseAbs { x, y }));
-                    }
-                }
-            }
-            WindowEvent::MouseInput { state, button, .. } => {
-                let b = match button {
-                    MouseButton::Left => pb::MouseButton::Left,
-                    MouseButton::Right => pb::MouseButton::Right,
-                    MouseButton::Middle => pb::MouseButton::Middle,
-                    MouseButton::Back => pb::MouseButton::X1,
-                    MouseButton::Forward => pb::MouseButton::X2,
-                    MouseButton::Other(_) => return,
-                };
-                self.send_input(Ev::MouseButton(pb::MouseButtonEv { button: b as i32, down: state == ElementState::Pressed }));
-            }
-            WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
-            WindowEvent::KeyboardInput { event, .. } => {
-                // Reaches us only when the hook didn't swallow the key (grab off, or the
-                // hook doesn't see keys in this environment). Hotkeys work either way.
-                use winit::keyboard::{KeyCode, PhysicalKey};
-                self.winit_keys += 1;
-                let m = self.mods;
-                if event.state == ElementState::Pressed && m.control_key() && m.alt_key() && m.shift_key() {
-                    let h = match event.physical_key {
-                        PhysicalKey::Code(KeyCode::KeyQ) => Some(Hotkey::ToggleGrab),
-                        PhysicalKey::Code(KeyCode::KeyS) => Some(Hotkey::ToggleStats),
-                        PhysicalKey::Code(KeyCode::KeyM) => Some(Hotkey::ToggleMode),
-                        PhysicalKey::Code(KeyCode::KeyR) => Some(Hotkey::ToggleRelative),
-                        PhysicalKey::Code(KeyCode::KeyF) => Some(Hotkey::ToggleFullscreen),
-                        PhysicalKey::Code(KeyCode::KeyD) => Some(Hotkey::CtrlAltDel),
-                        PhysicalKey::Code(KeyCode::KeyX) => Some(Hotkey::Quit),
-                        PhysicalKey::Code(c) => match c {
-                            KeyCode::Digit1 => Some(Hotkey::Display(1)),
-                            KeyCode::Digit2 => Some(Hotkey::Display(2)),
-                            KeyCode::Digit3 => Some(Hotkey::Display(3)),
-                            KeyCode::Digit4 => Some(Hotkey::Display(4)),
-                            _ => None,
-                        },
-                        _ => None,
-                    };
-                    if let Some(h) = h {
-                        self.hotkey(el, h);
-                        return;
-                    }
-                }
-                // Keys the hook forwarded were swallowed and never reach the window, so
-                // anything arriving here still has to go to the host (e.g. cloud desktops,
-                // where low-level hooks see no keys at all).
-                if input::grabbed() && self.focused {
-                    use winit::platform::scancode::PhysicalKeyExtScancode;
-                    if let Some(sc) = event.physical_key.to_scancode() {
-                        let (scancode, extended) = (sc & 0xff, sc & 0xff00 == 0xe000);
-                        if scancode != 0 {
-                            self.send_input(Ev::Key(pb::Key {
-                                scancode,
-                                extended,
-                                down: event.state == ElementState::Pressed,
-                            }));
-                        }
-                    }
-                }
-            }
-            WindowEvent::MouseWheel { delta, .. } => {
-                let (dx, dy) = match delta {
-                    MouseScrollDelta::LineDelta(x, y) => ((x * 120.0) as i32, (y * 120.0) as i32),
-                    MouseScrollDelta::PixelDelta(p) => (p.x as i32, p.y as i32),
-                };
-                if dx != 0 || dy != 0 {
-                    self.send_input(Ev::Wheel(pb::Wheel { dx, dy }));
                 }
             }
             _ => {}
+        }
+        if self.session.is_some() {
+            self.session_input(&event);
         }
     }
 
     fn device_event(&mut self, _el: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
         if let DeviceEvent::MouseMotion { delta } = event {
-            if self.relative && self.focused {
-                let (dx, dy) = (delta.0.round() as i32, delta.1.round() as i32);
-                if dx != 0 || dy != 0 {
-                    self.send_input(Ev::MouseRel(pb::MouseRel { dx, dy }));
+            if let Some(s) = &self.session {
+                if s.relative && self.focused {
+                    let (dx, dy) = (delta.0.round() as i32, delta.1.round() as i32);
+                    if dx != 0 || dy != 0 {
+                        s.send_input(Ev::MouseRel(pb::MouseRel { dx, dy }));
+                    }
                 }
             }
         }
     }
 
     fn user_event(&mut self, el: &ActiveEventLoop, event: UiEvent) {
-        let refresh_title = !matches!(event, UiEvent::Frame | UiEvent::Cursor(_));
         match event {
-            UiEvent::Frame => self.draw(),
-            UiEvent::Cursor(m) => self.on_cursor(el, m),
-            UiEvent::Connected { server_name } => {
-                self.status = String::new();
-                if self.host_label.is_empty() {
-                    self.host_label = server_name;
+            UiEvent::Frame => return self.draw(),
+            UiEvent::Cursor(m) => return self.on_cursor(el, m),
+            UiEvent::ConnectDone(d) => self.on_connect_done(d),
+            UiEvent::NeedPairing(tx) => {
+                self.pair_reply = Some(tx);
+                self.launcher.pairing = Some(PairingDialog { code: String::new() });
+            }
+            UiEvent::Hotkey(h) => self.hotkey(h),
+            UiEvent::Disconnected(msg) => self.end_session(Some(Notice::Error(msg))),
+            other => {
+                let Some(s) = self.session.as_mut() else { return };
+                match other {
+                    UiEvent::Connected => s.status.clear(),
+                    UiEvent::SessionInfo(i) => s.info = Some(i),
+                    UiEvent::StreamStarted(st) => {
+                        tracing::info!(
+                            "stream: {} {:?} cross_gpu={}",
+                            st.encoder_name,
+                            st.config.as_ref().map(|c| (c.width, c.height, c.fps, c.bitrate_kbps)),
+                            st.cross_gpu
+                        );
+                        s.game = st.config.as_ref().is_some_and(|c| c.mode == pb::StreamMode::Game as i32);
+                        s.stream = Some(st);
+                        s.status.clear();
+                        s.cursor_shape = 0;
+                    }
+                    UiEvent::StreamError(e) => {
+                        tracing::error!("stream error: {e}");
+                        s.status = format!("被控端无法开始推流：{e}");
+                    }
+                    UiEvent::ServerStats(st) => s.server_stats = Some(st),
+                    UiEvent::Clipboard(t) => s.clipboard_from_host(t),
+                    UiEvent::Reconnecting(msg) => {
+                        s.status = format!("连接中断，正在重连…（{msg}）");
+                        s.release_all();
+                    }
+                    _ => {}
                 }
-            }
-            UiEvent::SessionInfo(i) => self.session = Some(i),
-            UiEvent::StreamStarted(s) => {
-                tracing::info!(
-                    "stream: {} {:?} cross_gpu={}",
-                    s.encoder_name,
-                    s.config.as_ref().map(|c| (c.width, c.height, c.fps, c.bitrate_kbps)),
-                    s.cross_gpu
-                );
-                self.game = s.config.as_ref().is_some_and(|c| c.mode == pb::StreamMode::Game as i32);
-                self.stream = Some(s);
-                self.status = String::new();
-                self.cursor_shape = 0;
-            }
-            UiEvent::StreamError(e) => {
-                tracing::error!("stream error: {e}");
-                self.status = format!("被控端无法开始推流：{e}");
-            }
-            UiEvent::ServerStats(s) => self.server_stats = Some(s),
-            UiEvent::Clipboard(t) => {
-                if let Some(tx) = &self.clip_tx {
-                    let _ = tx.send(t);
-                }
-            }
-            UiEvent::Reconnecting(msg) => {
-                self.status = format!("连接中断，正在重连…（{msg}）");
-                self.send_input(Ev::ReleaseAll(pb::ReleaseAll {}));
-            }
-            UiEvent::Disconnected(msg) => return self.quit(el, Some(msg)),
-            UiEvent::Hotkey(h) => self.hotkey(el, h),
-        }
-        if refresh_title {
-            if let Some(w) = &self.window {
-                w.set_title(&self.title());
+                self.update_title();
             }
         }
+        self.request_redraw();
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        self.tick();
-        el.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(250)));
+        if self.exit {
+            el.exit();
+            return;
+        }
+        let mut redraw = false;
+        if let Some(s) = &mut self.session {
+            if s.tick() {
+                redraw = s.show_stats;
+                self.update_title();
+            }
+        }
+        if self.repaint_at.is_some_and(|t| Instant::now() >= t) {
+            self.repaint_at = None;
+            redraw = true;
+        }
+        if redraw {
+            self.request_redraw();
+        }
+        let next = Instant::now() + Duration::from_millis(250);
+        let wake = self.repaint_at.map_or(next, |t| t.min(next));
+        el.set_control_flow(ControlFlow::WaitUntil(wake));
     }
 }

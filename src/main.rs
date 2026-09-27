@@ -1,4 +1,9 @@
 //! NyaRemoteControl Windows client.
+//!
+//! Double-click: graphical launcher. `nya-client connect <host>` connects right
+//! away; `diag` / `hosts` print to the terminal they were started from.
+
+#![windows_subsystem = "windows"]
 
 mod app;
 mod audio;
@@ -8,24 +13,21 @@ mod config;
 mod diag;
 mod events;
 mod input;
-mod launcher;
 mod net;
-mod overlay;
 mod render;
+mod session;
 mod stats;
+mod ui;
 mod video;
 
-use std::sync::Arc;
-
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
-use nya_proto::pb;
-use nya_transport::{Fingerprint, Identity};
+use nya_transport::Identity;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use winit::event_loop::EventLoop;
 
-use crate::config::{ClientConfig, HostEntry};
+use crate::config::ClientConfig;
 use crate::events::{Ui, UiEvent};
 
 #[derive(Parser)]
@@ -37,7 +39,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// 连接被控端（已保存的名称或地址）
+    /// 直接连接被控端（已保存的名称或地址）
     Connect {
         target: String,
         /// 保存时使用的名称
@@ -76,6 +78,25 @@ enum Cmd {
     Diag,
 }
 
+/// Show an error to a user who has no console.
+pub fn fatal(msg: &str) {
+    use windows::core::HSTRING;
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+    tracing::error!("{msg}");
+    eprintln!("错误：{msg}");
+    unsafe {
+        MessageBoxW(None, &HSTRING::from(msg), &HSTRING::from("NyaRemoteControl"), MB_OK | MB_ICONERROR);
+    }
+}
+
+/// When started from a terminal, write to it despite the GUI subsystem.
+fn attach_console() {
+    use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
 fn init_logging(dir: &std::path::Path) -> Option<tracing_appender::non_blocking::WorkerGuard> {
     let filter = tracing_subscriber::EnvFilter::try_from_env("NYA_LOG").unwrap_or_else(|_| "info".into());
     let appender = tracing_appender::rolling::Builder::new()
@@ -100,37 +121,11 @@ fn init_logging(dir: &std::path::Path) -> Option<tracing_appender::non_blocking:
     guard
 }
 
-fn parse_codec(s: &str) -> pb::Codec {
-    match s.to_ascii_lowercase().as_str() {
-        "h264" | "avc" => pb::Codec::H264,
-        "hevc" | "h265" => pb::Codec::Hevc,
-        "av1" => pb::Codec::Av1,
-        _ => pb::Codec::Unspecified,
-    }
-}
-
-fn parse_chroma(s: &str) -> pb::Chroma {
-    match s {
-        "420" => pb::Chroma::Yuv420,
-        "444" => pb::Chroma::Yuv444,
-        _ => pb::Chroma::Unspecified,
-    }
-}
-
 fn main() {
+    attach_console();
     if let Err(e) = real_main() {
-        eprintln!("错误：{e:#}");
-        wait_key();
+        fatal(&format!("{e:#}"));
         std::process::exit(1);
-    }
-}
-
-/// Keep the console open when launched by double-click.
-fn wait_key() {
-    if std::env::args().len() <= 1 {
-        eprintln!("按回车键退出");
-        let mut s = String::new();
-        let _ = std::io::stdin().read_line(&mut s);
     }
 }
 
@@ -143,7 +138,7 @@ fn real_main() -> Result<()> {
     nya_media::init_log_level();
     let mut cfg = ClientConfig::load(&dir)?;
 
-    let (target, name) = match cli.cmd {
+    let auto_connect = match cli.cmd {
         Some(Cmd::Diag) => return diag::run(),
         Some(Cmd::Hosts { remove }) => {
             if let Some(r) = remove {
@@ -156,6 +151,7 @@ fn real_main() -> Result<()> {
             return Ok(());
         }
         Some(Cmd::Connect { target, name, mode, display, fullscreen, encoder, codec, chroma, bitrate, sw_decode }) => {
+            // Command-line overrides apply to this run only (until "保存设置").
             let d = &mut cfg.defaults;
             if let Some(m) = mode {
                 d.mode = m;
@@ -179,100 +175,18 @@ fn real_main() -> Result<()> {
             if sw_decode {
                 d.hw_decode = false;
             }
-            (target, name)
+            Some((target, name))
         }
-        None => (launcher::choose(&cfg).ok_or_else(|| anyhow!("没有选择被控端"))?, None),
+        None => None,
     };
 
     let identity = Identity::load_or_create(&dir)?;
-    let entry = cfg.find(&target).cloned();
-    let address = entry.as_ref().map(|e| e.address.clone()).unwrap_or_else(|| target.clone());
-    let addr = nya_transport::endpoint::resolve(&address, nya_proto::DEFAULT_PORT)?;
-    let pinned = entry.as_ref().and_then(|e| Fingerprint::from_hex(&e.fingerprint));
-    let client_name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "nya-client".into());
-
     let rt = tokio::runtime::Runtime::new()?;
-    println!("正在连接 {addr} …");
-    let prompt: net::PairPrompt = Arc::new(launcher::pairing_code);
-    let link = match rt.block_on(net::connect(addr, &identity, pinned, &client_name, Some(prompt.clone()))) {
-        Ok(l) => l,
-        Err(e) if pinned.is_some() && format!("{e:#}").contains(nya_transport::tls::PIN_MISMATCH) => {
-            println!();
-            println!("警告：被控端的证书和上次保存的不一样。");
-            println!("  常见原因：被控端从开发模式改成了服务模式，或者重装过；也可能有人在冒充被控端。");
-            if !launcher::confirm("是否重新验证这台被控端？(y/N)：") {
-                return Err(anyhow!("已取消连接"));
-            }
-            let l = rt.block_on(net::connect(addr, &identity, None, &client_name, Some(prompt)))?;
-            if l.welcome.needs_pairing {
-                println!("已通过配对码验证了新的被控端证书。");
-            } else {
-                // The host already knows us, so no pairing code proved its identity: compare by eye.
-                println!("新的证书指纹：{}", l.server_fp);
-                println!("请在被控端运行 `nya-server pair`，核对其中显示的“证书指纹”。");
-                if !launcher::confirm("两边的指纹一致吗？(y/N)：") {
-                    return Err(anyhow!("指纹未确认，已取消连接"));
-                }
-            }
-            l
-        }
-        Err(e) => return Err(e),
-    };
-    let server_name = link.welcome.server_name.clone();
-    println!("已连接到 {server_name}（证书 {}）", link.server_fp);
-
-    let label = name.or(entry.as_ref().map(|e| e.name.clone())).unwrap_or_else(|| server_name.clone());
-    cfg.upsert(HostEntry { name: label.clone(), address: address.clone(), fingerprint: link.server_fp.to_hex() });
-    cfg.save(&dir).context("save client.toml")?;
-
-    let d = cfg.defaults.clone();
-    let game = d.mode.eq_ignore_ascii_case("game");
-    let start = pb::StartStream {
-        display_id: d.display,
-        config: Some(pb::StreamConfig {
-            codec: parse_codec(&d.codec) as i32,
-            chroma: parse_chroma(&d.chroma) as i32,
-            width: 0,
-            height: 0,
-            fps: 0,
-            bitrate_kbps: d.bitrate_kbps,
-            mode: if game { pb::StreamMode::Game } else { pb::StreamMode::Office } as i32,
-        }),
-        encoder_preference: d.encoder.clone(),
-    };
-
-    let event_loop = EventLoop::<UiEvent>::with_user_event().build()?;
+    let event_loop = EventLoop::<UiEvent>::with_user_event().build().map_err(|e| anyhow!("{e}"))?;
     let ui = Ui(event_loop.create_proxy());
-    let (net_tx, net_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (video_tx, video_rx) = crossbeam_channel::bounded(16);
-    let (audio_tx, audio_rx) = crossbeam_channel::bounded(64);
-
-    let params = net::Params {
-        addr,
-        pinned: link.server_fp,
-        identity,
-        name: client_name,
-        caps: pb::ClientCaps::default(),
-        start,
-    };
-    let startup = app::Startup {
-        link,
-        params,
-        runtime: rt.handle().clone(),
-        net_rx,
-        video_rx,
-        audio_rx,
-        audio_tx,
-        audio: d.audio,
-        clipboard: d.clipboard,
-        max_fps: d.max_fps,
-    };
-    let mut app = app::App::new(startup, ui, net_tx, video_tx, d.hw_decode, label, d.fullscreen);
-    event_loop.run_app(&mut app)?;
+    let mut app = app::App::new(rt.handle().clone(), ui, dir, cfg, identity, auto_connect);
+    event_loop.run_app(&mut app).map_err(|e| anyhow!("{e}"))?;
     // Let the Bye go out.
-    rt.block_on(async { tokio::time::sleep(std::time::Duration::from_millis(200)).await });
-    if let Some(msg) = app.exit_message() {
-        return Err(anyhow!("{msg}"));
-    }
+    rt.shutdown_timeout(std::time::Duration::from_millis(300));
     Ok(())
 }

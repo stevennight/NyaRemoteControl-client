@@ -180,8 +180,8 @@ fn track(p: &mut Params, m: &pb::ControlMsg) {
 }
 
 async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetCmd>, sinks: &Sinks) -> End {
-    let Link { endpoint: _endpoint, conn, mut send, mut recv, neg, welcome, .. } = link;
-    sinks.ui.send(UiEvent::Connected { server_name: welcome.server_name.clone() });
+    let Link { endpoint: _endpoint, conn, mut send, mut recv, neg, .. } = link;
+    sinks.ui.send(UiEvent::Connected);
 
     let setup = async {
         write_msg(&mut send, &ctl(Msg::ClientCaps(p.caps.clone()))).await?;

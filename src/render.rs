@@ -1,15 +1,14 @@
-//! Presentation: flip-model swap chain, YUV→RGB shaders, letterboxing, and
-//! the statistics overlay.
+//! Presentation: flip-model swap chain, YUV→RGB shaders and letterboxing.
+//! The UI is painted between [`Renderer::draw_video`] and [`Renderer::present`].
 
 use anyhow::{anyhow, Result};
 use windows::core::Interface;
 use windows::Win32::Foundation::{BOOL, HWND};
-use windows::Win32::Graphics::Direct3D::{D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP, D3D11_SRV_DIMENSION_TEXTURE2D};
+use windows::Win32::Graphics::Direct3D::D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 
-use crate::overlay::OverlayImage;
 use crate::video::{Slot, SlotKind};
 use nya_media::decoder::Matrix;
 use nya_win::d3d::{compile_shader, D3dDevice};
@@ -59,14 +58,6 @@ fn yuv_params(matrix: Matrix, full_range: bool) -> ([f32; 4], [f32; 4], [f32; 4]
     (m0, m1, m2, off, scale)
 }
 
-struct OverlayTex {
-    version: u64,
-    w: u32,
-    h: u32,
-    tex: ID3D11Texture2D,
-    srv: ID3D11ShaderResourceView,
-}
-
 pub struct Renderer {
     pub dev: D3dDevice,
     swap: IDXGISwapChain1,
@@ -77,12 +68,9 @@ pub struct Renderer {
     ps_nv12: ID3D11PixelShader,
     ps_ayuv: ID3D11PixelShader,
     ps_planar: ID3D11PixelShader,
-    ps_rgba: ID3D11PixelShader,
     sampler: ID3D11SamplerState,
     cbuf: ID3D11Buffer,
-    blend: ID3D11BlendState,
     tearing_supported: bool,
-    overlay: Option<OverlayTex>,
 }
 
 impl Renderer {
@@ -150,19 +138,6 @@ impl Renderer {
             };
             let mut cbuf = None;
             d.CreateBuffer(&bd, None, Some(&mut cbuf))?;
-            let mut blend_desc = D3D11_BLEND_DESC::default();
-            blend_desc.RenderTarget[0] = D3D11_RENDER_TARGET_BLEND_DESC {
-                BlendEnable: true.into(),
-                SrcBlend: D3D11_BLEND_SRC_ALPHA,
-                DestBlend: D3D11_BLEND_INV_SRC_ALPHA,
-                BlendOp: D3D11_BLEND_OP_ADD,
-                SrcBlendAlpha: D3D11_BLEND_ONE,
-                DestBlendAlpha: D3D11_BLEND_ZERO,
-                BlendOpAlpha: D3D11_BLEND_OP_ADD,
-                RenderTargetWriteMask: D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8,
-            };
-            let mut blend = None;
-            d.CreateBlendState(&blend_desc, Some(&mut blend))?;
 
             Ok(Self {
                 swap,
@@ -173,12 +148,9 @@ impl Renderer {
                 ps_nv12: ps("ps_nv12")?,
                 ps_ayuv: ps("ps_ayuv")?,
                 ps_planar: ps("ps_planar")?,
-                ps_rgba: ps("ps_rgba")?,
                 sampler: sampler.unwrap(),
                 cbuf: cbuf.unwrap(),
-                blend: blend.unwrap(),
                 tearing_supported,
-                overlay: None,
                 dev,
             })
         }
@@ -225,48 +197,29 @@ impl Renderer {
         ]
     }
 
-    fn upload_overlay(&mut self, img: &OverlayImage) -> Result<()> {
-        if self.overlay.as_ref().is_some_and(|o| o.version == img.version) {
-            return Ok(());
+    /// Bind and clear the back buffer; returns its view for further drawing (UI).
+    pub fn begin(&mut self) -> Result<ID3D11RenderTargetView> {
+        let rtv = self.ensure_rtv()?;
+        unsafe {
+            self.dev.context.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
+            self.dev.context.ClearRenderTargetView(&rtv, &[0.0, 0.0, 0.0, 1.0]);
         }
-        let desc = D3D11_TEXTURE2D_DESC {
-            Width: img.width,
-            Height: img.height,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-            Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
-            CPUAccessFlags: 0,
-            MiscFlags: 0,
-        };
-        let init = D3D11_SUBRESOURCE_DATA {
-            pSysMem: img.bgra.as_ptr() as *const _,
-            SysMemPitch: img.width * 4,
-            SysMemSlicePitch: 0,
-        };
-        let mut tex = None;
-        unsafe { self.dev.device.CreateTexture2D(&desc, Some(&init), Some(&mut tex))? };
-        let tex = tex.ok_or_else(|| anyhow!("overlay texture"))?;
-        let sd = D3D11_SHADER_RESOURCE_VIEW_DESC {
-            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2D,
-            Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D11_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 1 } },
-        };
-        let mut srv = None;
-        unsafe { self.dev.device.CreateShaderResourceView(&tex, Some(&sd), Some(&mut srv))? };
-        self.overlay = Some(OverlayTex { version: img.version, w: img.width, h: img.height, tex, srv: srv.unwrap() });
-        Ok(())
+        Ok(rtv)
     }
 
-    /// Draw the latest frame (letterboxed) and the overlay, then present.
-    pub fn render(&mut self, slot: Option<&Slot>, overlay: Option<&OverlayImage>, allow_tearing: bool) -> Result<()> {
-        let rtv = self.ensure_rtv()?;
+    /// Draw a decoded frame letterboxed into the window.
+    pub fn draw_video(&mut self, s: &Slot) {
         let ctx = self.dev.context.clone();
+        let r = fit(self.width, self.height, s.width, s.height);
+        let (m0, m1, m2, off, scale) = yuv_params(s.matrix, s.full_range);
+        let cb = Cb { dst: self.ndc(r), m0, m1, m2, off, scale };
+        let ps = match s.kind {
+            SlotKind::Nv12 => &self.ps_nv12,
+            SlotKind::Ayuv => &self.ps_ayuv,
+            SlotKind::Planar => &self.ps_planar,
+        };
+        let views: Vec<Option<ID3D11ShaderResourceView>> = s.srvs.iter().cloned().map(Some).collect();
         unsafe {
-            ctx.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
-            ctx.ClearRenderTargetView(&rtv, &[0.0, 0.0, 0.0, 1.0]);
             let vp = D3D11_VIEWPORT {
                 TopLeftX: 0.0,
                 TopLeftY: 0.0,
@@ -276,6 +229,7 @@ impl Renderer {
                 MaxDepth: 1.0,
             };
             ctx.RSSetViewports(Some(&[vp]));
+            ctx.RSSetState(None);
             ctx.IASetInputLayout(None);
             ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
             ctx.VSSetShader(&self.vs, None);
@@ -283,49 +237,19 @@ impl Renderer {
             ctx.PSSetConstantBuffers(0, Some(&[Some(self.cbuf.clone())]));
             ctx.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
             ctx.OMSetBlendState(None, None, 0xffff_ffff);
-        }
-
-        if let Some(s) = slot {
-            let r = fit(self.width, self.height, s.width, s.height);
-            let (m0, m1, m2, off, scale) = yuv_params(s.matrix, s.full_range);
-            let cb = Cb { dst: self.ndc(r), m0, m1, m2, off, scale };
-            let ps = match s.kind {
-                SlotKind::Nv12 => &self.ps_nv12,
-                SlotKind::Ayuv => &self.ps_ayuv,
-                SlotKind::Planar => &self.ps_planar,
-            };
-            let views: Vec<Option<ID3D11ShaderResourceView>> = s.srvs.iter().cloned().map(Some).collect();
-            unsafe {
-                ctx.UpdateSubresource(&self.cbuf, 0, None, &cb as *const _ as *const _, 0, 0);
-                ctx.PSSetShader(ps, None);
-                ctx.PSSetShaderResources(0, Some(&views));
-                ctx.Draw(4, 0);
-            }
-        }
-
-        if let Some(img) = overlay {
-            self.upload_overlay(img)?;
-            let o = self.overlay.as_ref().unwrap();
-            let r = Rect { x: 12.0, y: 12.0, w: o.w as f64, h: o.h as f64 };
-            let cb = Cb { dst: self.ndc(r), ..Default::default() };
-            unsafe {
-                ctx.UpdateSubresource(&self.cbuf, 0, None, &cb as *const _ as *const _, 0, 0);
-                ctx.PSSetShader(&self.ps_rgba, None);
-                ctx.PSSetShaderResources(0, Some(&[Some(o.srv.clone())]));
-                ctx.OMSetBlendState(&self.blend, None, 0xffff_ffff);
-                ctx.Draw(4, 0);
-                ctx.OMSetBlendState(None, None, 0xffff_ffff);
-            }
-            let _ = &o.tex;
-        }
-
-        unsafe {
+            ctx.UpdateSubresource(&self.cbuf, 0, None, &cb as *const _ as *const _, 0, 0);
+            ctx.PSSetShader(ps, None);
+            ctx.PSSetShaderResources(0, Some(&views));
+            ctx.Draw(4, 0);
             ctx.PSSetShaderResources(0, Some(&[None, None, None]));
-            let tear = allow_tearing && self.tearing_supported;
-            let hr = self.swap.Present(0, if tear { DXGI_PRESENT_ALLOW_TEARING } else { DXGI_PRESENT(0) });
-            if hr.is_err() {
-                return Err(anyhow!("Present: {hr:?}"));
-            }
+        }
+    }
+
+    pub fn present(&mut self, allow_tearing: bool) -> Result<()> {
+        let tear = allow_tearing && self.tearing_supported;
+        let hr = unsafe { self.swap.Present(0, if tear { DXGI_PRESENT_ALLOW_TEARING } else { DXGI_PRESENT(0) }) };
+        if hr.is_err() {
+            return Err(anyhow!("Present: {hr:?}"));
         }
         Ok(())
     }
@@ -345,7 +269,7 @@ mod tests {
 
     #[test]
     fn shaders_compile() {
-        for (e, t) in [("vs_quad", "vs_4_0"), ("ps_nv12", "ps_4_0"), ("ps_ayuv", "ps_4_0"), ("ps_planar", "ps_4_0"), ("ps_rgba", "ps_4_0")] {
+        for (e, t) in [("vs_quad", "vs_4_0"), ("ps_nv12", "ps_4_0"), ("ps_ayuv", "ps_4_0"), ("ps_planar", "ps_4_0")] {
             compile_shader(HLSL, e, t).unwrap();
         }
     }

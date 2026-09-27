@@ -1,5 +1,5 @@
-// Client presentation: YUV -> RGB with a CPU-supplied matrix, plus an RGBA
-// quad for the statistics overlay. Quads are drawn as 4-vertex strips.
+// Client presentation: YUV -> RGB with a CPU-supplied matrix, drawn as a
+// 4-vertex strip.
 
 cbuffer Params : register(b0) {
     float4 dst;    // NDC: x0, y_top, x1, y_bottom
@@ -44,8 +44,4 @@ float4 ps_ayuv(VSOut i) : SV_Target {
 
 float4 ps_planar(VSOut i) : SV_Target {
     return to_rgb(float3(t0.Sample(samp, i.uv).r, t1.Sample(samp, i.uv).r, t2.Sample(samp, i.uv).r));
-}
-
-float4 ps_rgba(VSOut i) : SV_Target {
-    return t0.Sample(samp, i.uv);
 }
