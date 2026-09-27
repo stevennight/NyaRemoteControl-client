@@ -75,6 +75,11 @@ impl FrameStore {
         (s, fresh)
     }
 
+    /// Kind of the latest frame, for logging.
+    pub fn take_kind(&self) -> Option<SlotKind> {
+        self.latest.lock().unwrap().as_ref().map(|s| s.kind)
+    }
+
     pub fn clear(&self) {
         *self.latest.lock().unwrap() = None;
     }
@@ -363,6 +368,13 @@ impl VideoThread {
                     let decode_ms = t.elapsed().as_secs_f32() * 1000.0;
                     if let Some(slot) = published {
                         let dropped = self.store.put(Arc::new(slot));
+                        let first = self.stats.with(|s| {
+                            s.total_decoded += 1;
+                            s.total_decoded == 1
+                        });
+                        if first {
+                            tracing::info!("first frame decoded ({:?}, {:.1} ms)", self.store.take_kind(), decode_ms);
+                        }
                         self.stats.with(|s| {
                             s.decode_ms.push(decode_ms);
                             s.frames_decoded += 1;

@@ -265,6 +265,7 @@ async fn accept_uni(conn: Connection, video: Sender<VideoIn>, ui: Ui, stats: Arc
             match read_varint(&mut r).await {
                 Ok(Some(stream_type::VIDEO)) => {
                     let Ok(Some(stream_id)) = read_varint(&mut r).await else { return };
+                    tracing::info!("video stream {stream_id} opened by host");
                     loop {
                         let mut len = [0u8; 4];
                         if r.read_exact(&mut len).await.is_err() {
@@ -279,9 +280,17 @@ async fn accept_uni(conn: Connection, video: Sender<VideoIn>, ui: Ui, stats: Arc
                         if r.read_exact(&mut buf).await.is_err() {
                             return;
                         }
-                        stats.with(|s| s.bytes += len as u64);
+                        let first = stats.with(|s| {
+                            s.bytes += len as u64;
+                            s.total_rx_bytes += len as u64;
+                            s.total_rx_frames += 1;
+                            s.total_rx_frames == 1
+                        });
+                        if first {
+                            tracing::info!("first video frame received: stream {stream_id}, {len} bytes");
+                        }
                         if video.try_send(VideoIn::Frame { stream_id, buf }).is_err() {
-                            tracing::debug!("decoder queue full; dropping frame");
+                            tracing::warn!("decoder queue full; dropping frame");
                         }
                     }
                 }

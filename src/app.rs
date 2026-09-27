@@ -73,6 +73,8 @@ pub struct App {
     overlay_version: u64,
     last_tick: Instant,
     summary: Summary,
+    status_log: Instant,
+    last_rendered_total: u64,
     exit_message: Option<String>,
 }
 
@@ -124,6 +126,8 @@ impl App {
             overlay_version: 0,
             last_tick: Instant::now(),
             summary: Summary::default(),
+            status_log: Instant::now(),
+            last_rendered_total: 0,
             exit_message: None,
         }
     }
@@ -238,6 +242,12 @@ impl App {
             return;
         }
         let render_ms = t.elapsed().as_secs_f32() * 1000.0;
+        if fresh && self.stats.with(|s| s.total_rendered == 0) {
+            tracing::info!("first frame rendered ({:.1} ms)", render_ms);
+        }
+        if fresh {
+            self.stats.with(|s| s.total_rendered += 1);
+        }
         if fresh {
             let lat = self.current.as_ref().map(|s| self.stats.latency_ms(s.capture_ts));
             self.stats.with(|s| {
@@ -387,6 +397,14 @@ impl App {
         if secs < 1.0 {
             return;
         }
+        if self.stream.is_some() && self.status_log.elapsed() >= Duration::from_secs(5) {
+            self.status_log = Instant::now();
+            let (f, b, d, r) = self.stats.with(|s| (s.total_rx_frames, s.total_rx_bytes, s.total_decoded, s.total_rendered));
+            if r == self.last_rendered_total {
+                tracing::warn!("no new picture in 5 s: received {f} frames / {} KB, decoded {d}, rendered {r}", b / 1024);
+            }
+            self.last_rendered_total = r;
+        }
         self.last_tick = Instant::now();
         self.summary = self.stats.take_summary(secs);
         let s = &self.summary;
@@ -431,6 +449,9 @@ impl ApplicationHandler<UiEvent> for App {
         if let Err(e) = self.create_renderer(dev.clone()) {
             return self.quit(el, Some(format!("无法初始化渲染：{e:#}")));
         }
+        tracing::info!("renderer on adapter luid {:#x}", self.adapter_luid);
+        // Paint black right away instead of leaving the window uninitialised.
+        self.draw();
 
         let max_fps = if st.max_fps > 0 { st.max_fps } else { monitor_fps };
         let caps = caps::detect(&dev, self.hw_decode, max_fps);

@@ -15,6 +15,11 @@ pub struct Stats {
     pub frames_dropped: u32,
     pub bytes: u64,
     pub decoder: String,
+    /// Totals since start (never reset), for the "no picture" status log.
+    pub total_rx_frames: u64,
+    pub total_rx_bytes: u64,
+    pub total_decoded: u64,
+    pub total_rendered: u64,
 }
 
 pub struct Shared(pub Mutex<Stats>);
