@@ -59,6 +59,8 @@ pub struct Session {
     /// busid -> (attached on the host, last message)
     pub usb_state: HashMap<String, (bool, String)>,
     pub usb_busy: std::collections::HashSet<String>,
+    /// usbipd-win one-click install: (running, message)
+    pub usbipd_install: Option<(bool, String)>,
     pub offers: Vec<pb::FileOffer>,
     /// Current stream request (display, mode …), replayed on reconnect.
     pub start: pb::StartStream,
@@ -139,6 +141,7 @@ impl Session {
             usb_devices: None,
             usb_state: HashMap::new(),
             usb_busy: Default::default(),
+            usbipd_install: None,
             offers: Vec::new(),
             start,
             status: "连接中".into(),

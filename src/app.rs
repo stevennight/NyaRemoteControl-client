@@ -518,6 +518,22 @@ impl App {
                     }
                 }
                 Action::RefreshUsb => self.refresh_usb(),
+                Action::InstallUsbipd => {
+                    if let Some(s) = &mut self.session {
+                        s.usbipd_install = Some((true, "准备安装包…".into()));
+                    }
+                    let ui = self.ui_tx.clone();
+                    std::thread::spawn(move || {
+                        let r = crate::usb::install_usbipd(&mut |m| ui.send(UiEvent::UsbipdInstall(true, m)));
+                        ui.send(UiEvent::UsbipdInstall(
+                            false,
+                            match r {
+                                Ok(()) => "安装完成".into(),
+                                Err(e) => format!("安装失败：{e:#}"),
+                            },
+                        ));
+                    });
+                }
                 Action::UsbAttach { busid, description, bound } => {
                     if let Some(s) = &mut self.session {
                         s.usb_busy.insert(busid.clone());
@@ -987,6 +1003,15 @@ impl ApplicationHandler<UiEvent> for App {
             UiEvent::UsbStatus(st) => {
                 if let Some(s) = &mut self.session {
                     s.on_usb_status(st);
+                }
+            }
+            UiEvent::UsbipdInstall(running, msg) => {
+                let done = !running;
+                if let Some(s) = &mut self.session {
+                    s.usbipd_install = Some((running, msg));
+                }
+                if done {
+                    self.refresh_usb();
                 }
             }
             UiEvent::UsbDevices(r) => {

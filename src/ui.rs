@@ -27,6 +27,7 @@ pub enum Action {
     SetPolicy(nya_proto::pb::BitratePolicy),
     SetMic(bool),
     ToggleUsb,
+    InstallUsbipd,
     RefreshUsb,
     UsbAttach { busid: String, description: String, bound: bool },
     UsbDetach(String),
@@ -632,8 +633,22 @@ fn usb_window(ctx: &egui::Context, s: &Session, actions: &mut Vec<Action>) {
     egui::Window::new("USB 设备透传").open(&mut open).default_pos([60.0, 80.0]).default_width(460.0).show(ctx, |ui| {
         if crate::usb::usbipd_exe().is_none() {
             ui.label("需要在本机安装 usbipd-win（可选组件，开源免费）。");
-            if ui.button("打开 usbipd-win 下载页").clicked() {
-                let _ = std::process::Command::new("explorer").arg(crate::usb::DOWNLOAD_URL).spawn();
+            let running = s.usbipd_install.as_ref().is_some_and(|i| i.0);
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!running, egui::Button::new("一键安装")).on_hover_text("自动下载固定版本、校验后静默安装，会弹出一次管理员权限确认").clicked() {
+                    actions.push(Action::InstallUsbipd);
+                }
+                if ui.button("官网").clicked() {
+                    let _ = std::process::Command::new("explorer").arg(crate::usb::DOWNLOAD_URL).spawn();
+                }
+            });
+            if let Some((running, msg)) = &s.usbipd_install {
+                ui.horizontal(|ui| {
+                    if *running {
+                        ui.spinner();
+                    }
+                    ui.label(msg);
+                });
             }
             return;
         }

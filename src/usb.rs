@@ -12,6 +12,35 @@ use tokio::io::AsyncWriteExt;
 pub const USBIPD_PORT: u16 = 3240;
 pub const DOWNLOAD_URL: &str = "https://github.com/dorssel/usbipd-win/releases";
 
+/// Pinned usbipd-win installer (bundled in `drivers\` or downloaded).
+pub const USBIPD: nya_win::package::Package = nya_win::package::Package {
+    file: "usbipd-win_5.3.0_x64.msi",
+    url: "https://github.com/dorssel/usbipd-win/releases/download/v5.3.0/usbipd-win_5.3.0_x64.msi",
+    sha256: "1c984914aec944de19b64eff232421439629699f8138e3ddc29301175bc6d938",
+};
+
+/// Download (if needed) and install usbipd-win silently; one UAC prompt.
+pub fn install_usbipd(status: &mut dyn FnMut(String)) -> Result<()> {
+    status("准备安装包…".into());
+    let msi = nya_win::package::obtain(&USBIPD, &mut |done, total| {
+        status(match total {
+            Some(t) if t > 0 => format!("下载中 {:.1} / {:.1} MB", done as f64 / 1e6, t as f64 / 1e6),
+            _ => format!("下载中 {:.1} MB", done as f64 / 1e6),
+        })
+    })?;
+    status("安装中（请在弹出的权限确认里点“是”）…".into());
+    let msiexec = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| "C:\\Windows".into()).join("System32\\msiexec.exe");
+    let code = nya_win::package::run_elevated(&msiexec, &format!("/i \"{}\" /qn /norestart", msi.display()))?;
+    if nya_win::package::setup_ok(code).is_none() {
+        bail!("安装程序返回错误代码 {code}");
+    }
+    if usbipd_exe().is_none() {
+        bail!("安装完成但没有找到 usbipd.exe");
+    }
+    tracing::info!("usbipd-win installed");
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct UsbDevice {
     pub busid: String,
