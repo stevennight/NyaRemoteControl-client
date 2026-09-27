@@ -208,6 +208,17 @@ impl VideoThread {
         }
     }
 
+    /// Did capability detection find a hardware decoder for this format?
+    fn hw_capable(&self, codec: VideoCodec, yuv444: bool) -> bool {
+        let pc = match codec {
+            VideoCodec::H264 => pb::Codec::H264,
+            VideoCodec::Hevc => pb::Codec::Hevc,
+            VideoCodec::Av1 => pb::Codec::Av1,
+        } as i32;
+        let chroma = if yuv444 { pb::Chroma::Yuv444 } else { pb::Chroma::Yuv420 } as i32;
+        self.caps.decoders.iter().any(|d| d.codec == pc && d.chroma == chroma && d.hardware)
+    }
+
     /// Tell the host we can't decode (codec, chroma) in hardware after all.
     fn downgrade_caps(&mut self, codec: VideoCodec, yuv444: bool) {
         let pc = match codec {
@@ -278,9 +289,19 @@ impl VideoThread {
                     }
 
                     if dec.as_ref().map(|d| (d.0, d.1)) != Some((codec, yuv444)) {
-                        let hw = self.hw_allowed && !hw_failed.contains(&(codec, yuv444));
-                        let raw = if hw { dev.device_raw_owned() } else { std::ptr::null_mut() };
-                        match VideoDecoder::new(codec, raw) {
+                        let hw = self.hw_allowed && !hw_failed.contains(&(codec, yuv444)) && self.hw_capable(codec, yuv444);
+                        let opened = if hw {
+                            VideoDecoder::new(codec, dev.device_raw_owned()).or_else(|e| {
+                                // Remember and fall back to software right away.
+                                tracing::warn!("hardware decoder unavailable ({e:#}); using software decoding");
+                                hw_failed.insert((codec, yuv444));
+                                self.downgrade_caps(codec, yuv444);
+                                VideoDecoder::new(codec, std::ptr::null_mut())
+                            })
+                        } else {
+                            VideoDecoder::new(codec, std::ptr::null_mut())
+                        };
+                        match opened {
                             Ok(d) => {
                                 self.stats.with(|s| {
                                     s.decoder = format!("{} {}", codec.name(), if d.is_hardware() { "硬解" } else { "软解" })
