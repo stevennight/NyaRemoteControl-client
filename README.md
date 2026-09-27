@@ -81,3 +81,13 @@ fingerprint = "…"
 cargo build --release
 .\scripts\package.ps1      # 生成 dist\nya-client
 ```
+
+## 仓库布局
+
+本项目由三个仓库组成，需要克隆到同一个父目录下（server / client 通过 `../common` 引用公共库）：
+
+```powershell
+gh repo clone stevennight/NyaRemoteControl-common common
+gh repo clone stevennight/NyaRemoteControl-server server
+gh repo clone stevennight/NyaRemoteControl-client client
+```
