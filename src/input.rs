@@ -11,8 +11,8 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyW, MAPVK_VK_TO_VSC_EX};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetForegroundWindow, SetWindowsHookExW, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED,
-    LLKHF_INJECTED, LLKHF_UP, WH_KEYBOARD_LL,
+    CallNextHookEx, GetForegroundWindow, SetWindowsHookExW, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_UP,
+    WH_KEYBOARD_LL,
 };
 
 use crate::events::{Hotkey, NetCmd, Ui, UiEvent};
@@ -90,7 +90,9 @@ unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
         let s = state();
         let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
         let ours = GetForegroundWindow().0 as isize == s.hwnd.load(Ordering::Relaxed);
-        if ours && kb.flags.0 & LLKHF_INJECTED.0 == 0 {
+        // Injected keys are processed too: in cloud desktops / remote sessions
+        // every keystroke arrives injected. We never inject locally, so no loop.
+        if ours {
             let down = kb.flags.0 & LLKHF_UP.0 == 0;
             let bit = modifier_bit(kb.vkCode);
             if bit != 0 {
