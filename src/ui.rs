@@ -281,13 +281,18 @@ fn settings(ui: &mut egui::Ui, d: &mut Defaults) -> bool {
         });
         ui.end_row();
 
-        ui.label("码率");
+        ui.label("码率上限");
         ui.horizontal(|ui| {
-            let mut auto = d.bitrate_kbps == 0;
-            if ui.checkbox(&mut auto, "自动").changed() {
-                d.bitrate_kbps = if auto { 0 } else { 10_000 };
+            let mut mode = if d.unlimited_bitrate { 2 } else if d.bitrate_kbps == 0 { 0 } else { 1 };
+            let before = mode;
+            ui.selectable_value(&mut mode, 0, "自动").on_hover_text("按分辨率和帧率估算，1080p60 办公约 7.5 Mbps");
+            ui.selectable_value(&mut mode, 2, "不限制").on_hover_text("最高 80 Mbps；静止画面只占用实际需要的带宽");
+            ui.selectable_value(&mut mode, 1, "手动");
+            if mode != before {
+                d.unlimited_bitrate = mode == 2;
+                d.bitrate_kbps = if mode == 1 { 10_000 } else { 0 };
             }
-            if !auto {
+            if mode == 1 {
                 ui.add(egui::Slider::new(&mut d.bitrate_kbps, 1_000..=80_000).suffix(" kbps").logarithmic(true));
             }
         });

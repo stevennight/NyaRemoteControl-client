@@ -105,6 +105,10 @@ fn parse_chroma(s: &str) -> pb::Chroma {
     }
 }
 
+/// "不限制": the top of the encoder's range; static office content still only
+/// uses what it needs.
+const UNLIMITED_KBPS: u32 = 80_000;
+
 fn start_request(d: &Defaults) -> pb::StartStream {
     let game = d.mode.eq_ignore_ascii_case("game");
     pb::StartStream {
@@ -115,7 +119,7 @@ fn start_request(d: &Defaults) -> pb::StartStream {
             width: 0,
             height: 0,
             fps: 0,
-            bitrate_kbps: d.bitrate_kbps,
+            bitrate_kbps: if d.unlimited_bitrate { UNLIMITED_KBPS } else { d.bitrate_kbps },
             mode: if game { pb::StreamMode::Game } else { pb::StreamMode::Office } as i32,
             bitrate_policy: crate::ui::parse_policy(&d.bitrate_policy) as i32,
         }),

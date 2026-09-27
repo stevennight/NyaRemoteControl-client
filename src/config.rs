@@ -27,6 +27,8 @@ pub struct Defaults {
     pub display: u32,
     /// 0 = let the host decide.
     pub bitrate_kbps: u32,
+    /// Ask for the highest bitrate the encoder allows (ignores `bitrate_kbps`).
+    pub unlimited_bitrate: bool,
     /// "auto" | "quality" | "balanced" | "smooth" | "fixed"
     pub bitrate_policy: String,
     /// 0 = local monitor refresh rate.
@@ -50,6 +52,7 @@ impl Default for Defaults {
             fullscreen: false,
             display: 0,
             bitrate_kbps: 0,
+            unlimited_bitrate: false,
             bitrate_policy: "auto".into(),
             max_fps: 0,
             encoder: "auto".into(),
