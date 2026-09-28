@@ -38,6 +38,14 @@ pub struct TransferView {
     pub folder: Option<std::path::PathBuf>,
 }
 
+/// Host display choices of the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DisplayChoice {
+    pub count: u32,
+    pub physical_off: bool,
+    pub block_input: bool,
+}
+
 pub struct SessionOptions {
     pub hw_decode: bool,
     pub audio: bool,
@@ -228,11 +236,14 @@ impl Session {
         self.status = "正在切换码率策略…".into();
     }
 
-    pub fn display_mode(&self) -> pb::DisplayMode {
-        self.start
-            .virtual_display
-            .and_then(|v| pb::DisplayMode::try_from(v.mode).ok())
-            .unwrap_or(pb::DisplayMode::Physical)
+    /// (virtual screens, physical displays off, local input blocked) as requested now.
+    pub fn display_choice(&self) -> DisplayChoice {
+        let s = self.start.display_setup.as_ref();
+        DisplayChoice {
+            count: s.map(|s| s.virtual_screens.len() as u32).unwrap_or(0),
+            physical_off: s.is_some_and(|s| s.physical_off),
+            block_input: s.is_some_and(|s| s.block_local_input),
+        }
     }
 
     /// Can the host create a virtual display?
@@ -240,35 +251,37 @@ impl Session {
         self.vd_supported && self.info.as_ref().is_some_and(|i| i.virtual_display_available)
     }
 
-    /// Change the host display setup (mode or virtual display size).
-    pub fn set_virtual_display(&mut self, vd: Option<pb::VirtualDisplay>) {
-        let vd = vd.filter(|v| v.mode != pb::DisplayMode::Physical as i32);
-        if self.start.virtual_display == vd {
+    /// Change the host display setup (virtual screens, their size, physical
+    /// displays, local input).
+    pub fn set_display_setup(&mut self, setup: Option<pb::DisplaySetup>) {
+        let setup = setup.filter(|s| !s.virtual_screens.is_empty() || s.block_local_input);
+        if self.start.display_setup == setup {
             return;
         }
-        let was = self.display_mode();
-        self.start.virtual_display = vd;
-        let now = self.display_mode();
-        if now != was {
-            // The virtual display is the host's primary display while it exists.
+        let was = self.display_choice();
+        self.start.display_setup = setup.clone();
+        let now = self.display_choice();
+        if now.count != was.count {
+            // The first virtual screen is the host's primary display while it exists.
             self.start.display_id = 0;
         }
         let _ = self.net_tx.send(ctl(Msg::StartStream(self.start.clone())));
-        self.status = match (was == now, now) {
-            (true, _) => {
-                let v = vd.unwrap_or_default();
-                format!("正在调整被控端分辨率为 {}x{}…", v.width, v.height)
-            }
-            (false, pb::DisplayMode::Physical) => "正在恢复被控端的物理显示器…".into(),
-            (false, pb::DisplayMode::Virtual) => "正在创建虚拟显示器…".into(),
-            (false, pb::DisplayMode::Private) => "正在创建虚拟显示器，被控端屏幕将黑屏…".into(),
+        self.status = if now == was {
+            let v = setup.and_then(|s| s.virtual_screens.first().copied()).unwrap_or_default();
+            format!("正在调整被控端分辨率为 {}x{}…", v.width, v.height)
+        } else if now.count == 0 && was.count > 0 {
+            "正在移除虚拟显示器…".into()
+        } else if now.count != was.count {
+            format!("正在创建 {} 个虚拟显示器…", now.count)
+        } else {
+            "正在调整被控端显示器…".into()
         };
     }
 
     /// The host could not set up the virtual display and streams a physical
     /// one instead: stop asking for it.
     pub fn virtual_display_failed(&mut self, msg: &str) {
-        self.start.virtual_display = None;
+        self.start.display_setup = None;
         self.notice(msg.to_owned(), Duration::from_secs(10));
     }
 

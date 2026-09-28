@@ -43,8 +43,12 @@ pub struct Defaults {
     pub clipboard: bool,
     /// Use hardware decoding when possible.
     pub hw_decode: bool,
-    /// "physical" | "virtual" | "private" (virtual display only, host screens dark)
-    pub display_mode: String,
+    /// Virtual screens to create on the host (0 = none, up to 4).
+    pub vd_count: u32,
+    /// Switch the host's physical displays off (with at least one virtual screen).
+    pub physical_off: bool,
+    /// Block the host's own keyboard and mouse.
+    pub block_input: bool,
     /// Virtual display size: "window" (follows this window) | "screen" | "fixed"
     pub vd_size: String,
     pub vd_width: u32,
@@ -69,7 +73,9 @@ impl Default for Defaults {
             audio: true,
             clipboard: true,
             hw_decode: true,
-            display_mode: "physical".into(),
+            vd_count: 0,
+            physical_off: false,
+            block_input: false,
             vd_size: "window".into(),
             vd_width: 1920,
             vd_height: 1080,

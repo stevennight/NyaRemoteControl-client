@@ -24,7 +24,7 @@ pub enum Action {
     Hotkey(Hotkey),
     SetGameMode(bool),
     SelectDisplay(u32),
-    SetDisplayMode(nya_proto::pb::DisplayMode),
+    SetDisplayChoice(crate::session::DisplayChoice),
     SetGrab(bool),
     SetPolicy(nya_proto::pb::BitratePolicy),
     SetMic(bool),
@@ -64,38 +64,29 @@ fn policy_label(s: &str) -> &'static str {
     POLICIES.iter().find(|p| p.0 == s).map(|p| p.1).unwrap_or("自动")
 }
 
-const DISPLAY_MODES: [(&str, &str, &str); 3] = [
-    ("physical", "物理显示器", "直接传输被控端现有的显示器，被控端屏幕照常显示"),
-    (
-        "virtual",
-        "虚拟显示器",
-        "被控端新增一个虚拟显示器（设为主显示器），分辨率按下面的设置；物理显示器照常显示，可以当扩展屏用。需要被控端安装“虚拟显示器”组件",
-    ),
-    (
-        "private",
-        "隐私屏",
-        "只保留虚拟显示器：被控端的物理显示器黑屏（无信号），本地键盘鼠标被屏蔽，旁人看不到也操作不了。断开后自动恢复。需要被控端安装“虚拟显示器”组件，并以服务模式运行",
-    ),
-];
-
-fn display_mode_key(m: nya_proto::pb::DisplayMode) -> &'static str {
-    match m {
-        nya_proto::pb::DisplayMode::Virtual => "virtual",
-        nya_proto::pb::DisplayMode::Private => "private",
-        nya_proto::pb::DisplayMode::Physical => "physical",
+/// Controls for the host display setup; returns true if something changed.
+fn display_choice_ui(ui: &mut egui::Ui, c: &mut crate::session::DisplayChoice) -> bool {
+    let before = *c;
+    ui.horizontal(|ui| {
+        ui.label("虚拟显示器");
+        for (n, label) in [(0, "不用"), (1, "1 个"), (2, "2 个"), (3, "3 个"), (4, "4 个")] {
+            ui.selectable_value(&mut c.count, n, label);
+        }
+    })
+    .response
+    .on_hover_text("在被控端新建虚拟显示器（第一个设为主显示器）。多个时可在“显示器”里切换查看。需要被控端安装“虚拟显示器”组件，并以服务模式运行");
+    ui.add_enabled_ui(c.count > 0, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("被控端物理显示器");
+            ui.selectable_value(&mut c.physical_off, false, "保持显示").on_hover_text("物理显示器和虚拟显示器同时存在（扩展屏）");
+            ui.selectable_value(&mut c.physical_off, true, "关闭（黑屏）").on_hover_text("只保留虚拟显示器，被控端屏幕黑屏；断开后自动恢复");
+        });
+    });
+    ui.checkbox(&mut c.block_input, "屏蔽被控端本地键盘鼠标").on_hover_text("远程操作时，被控端旁边的人无法操作（Ctrl+Alt+Del 除外）");
+    if c.count == 0 {
+        c.physical_off = false;
     }
-}
-
-fn parse_display_mode(s: &str) -> nya_proto::pb::DisplayMode {
-    match s {
-        "virtual" => nya_proto::pb::DisplayMode::Virtual,
-        "private" => nya_proto::pb::DisplayMode::Private,
-        _ => nya_proto::pb::DisplayMode::Physical,
-    }
-}
-
-fn display_mode_label(s: &str) -> &'static str {
-    DISPLAY_MODES.iter().find(|m| m.0 == s).map(|m| m.1).unwrap_or("物理显示器")
+    *c != before
 }
 
 fn size_text(b: u64) -> String {
@@ -425,14 +416,15 @@ fn settings(ui: &mut egui::Ui, d: &mut Defaults) -> bool {
         ui.end_row();
 
         ui.label("被控端显示器");
-        ui.horizontal(|ui| {
-            for (key, name, tip) in DISPLAY_MODES {
-                ui.selectable_value(&mut d.display_mode, key.to_string(), name).on_hover_text(tip);
+        ui.vertical(|ui| {
+            let mut c = crate::session::DisplayChoice { count: d.vd_count, physical_off: d.physical_off, block_input: d.block_input };
+            if display_choice_ui(ui, &mut c) {
+                (d.vd_count, d.physical_off, d.block_input) = (c.count, c.physical_off, c.block_input);
             }
         });
         ui.end_row();
 
-        if d.display_mode != "physical" {
+        if d.vd_count > 0 {
             ui.label("虚拟显示器分辨率");
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
@@ -553,14 +545,32 @@ pub fn session_overlay(
                             }
                         });
                     }
-                    let mode = display_mode_key(s.display_mode());
                     if s.vd_available() {
-                        egui::ComboBox::from_id_salt("display-mode").selected_text(display_mode_label(mode)).show_ui(ui, |ui| {
-                            for (key, name, tip) in DISPLAY_MODES {
-                                if ui.selectable_label(key == mode, name).on_hover_text(tip).clicked() && key != mode {
-                                    actions.push(Action::SetDisplayMode(parse_display_mode(key)));
-                                }
+                        let current = s.display_choice();
+                        let label = match (current.count, current.physical_off, current.block_input) {
+                            (0, _, false) => "显示设置".to_string(),
+                            (n, true, true) if n > 0 => "隐私屏".to_string(),
+                            (0, _, true) => "已屏蔽本地键鼠".to_string(),
+                            (n, off, _) => format!("虚拟屏 ×{n}{}", if off { "（物理屏关）" } else { "" }),
+                        };
+                        ui.menu_button(format!("🖵 {label}"), |ui| {
+                            ui.set_min_width(300.0);
+                            let mut c = current;
+                            if display_choice_ui(ui, &mut c) {
+                                actions.push(Action::SetDisplayChoice(c));
                             }
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                if ui.button("隐私屏").on_hover_text("1 个虚拟显示器 + 物理显示器黑屏 + 屏蔽本地键鼠").clicked() {
+                                    let c = crate::session::DisplayChoice { count: current.count.max(1), physical_off: true, block_input: true };
+                                    actions.push(Action::SetDisplayChoice(c));
+                                    ui.close_menu();
+                                }
+                                if ui.button("恢复被控端原样").clicked() {
+                                    actions.push(Action::SetDisplayChoice(Default::default()));
+                                    ui.close_menu();
+                                }
+                            });
                         });
                     } else if s.info.is_some() {
                         ui.add_enabled(false, egui::Button::new("虚拟显示器")).on_disabled_hover_text(if s.vd_supported {
@@ -569,7 +579,6 @@ pub fn session_overlay(
                             "被控端版本太旧，不支持虚拟显示器"
                         });
                     }
-
                     let mut game = s.game;
                     ui.selectable_value(&mut game, false, "办公");
                     ui.selectable_value(&mut game, true, "游戏");

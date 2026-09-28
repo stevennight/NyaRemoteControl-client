@@ -22,7 +22,7 @@ use crate::config::{ClientConfig, Defaults, HostEntry};
 use crate::events::{ConnectDone, Hotkey, Ui, UiEvent};
 use crate::net::{self, Link, PairPrompt, Params};
 use crate::render::{fit, Renderer};
-use crate::session::{Session, SessionOptions};
+use crate::session::{DisplayChoice, Session, SessionOptions};
 use crate::ui::{self, Action, LauncherState, Notice, PairingDialog};
 use crate::{caps, input};
 
@@ -111,25 +111,17 @@ fn parse_chroma(s: &str) -> pb::Chroma {
 /// uses what it needs.
 const UNLIMITED_KBPS: u32 = 80_000;
 
-fn parse_display_mode(s: &str) -> pb::DisplayMode {
-    match s {
-        "virtual" => pb::DisplayMode::Virtual,
-        "private" => pb::DisplayMode::Private,
-        _ => pb::DisplayMode::Physical,
-    }
-}
-
 /// Virtual display sizes: width a multiple of 8, height even, at least 640x480.
 fn vd_dims(w: u32, h: u32) -> (u32, u32) {
     ((w & !7).max(640), (h & !1).max(480))
 }
 
-fn start_request(d: &Defaults, vd: Option<pb::VirtualDisplay>) -> pb::StartStream {
+fn start_request(d: &Defaults, setup: Option<pb::DisplaySetup>) -> pb::StartStream {
     let game = d.mode.eq_ignore_ascii_case("game");
     pb::StartStream {
-        // A virtual display is streamed as the host's primary display.
-        display_id: if vd.is_some() { 0 } else { d.display },
-        virtual_display: vd,
+        // The first virtual screen is the host's primary display.
+        display_id: if setup.as_ref().is_some_and(|s| !s.virtual_screens.is_empty()) { 0 } else { d.display },
+        display_setup: setup,
         config: Some(pb::StreamConfig {
             codec: parse_codec(&d.codec) as i32,
             chroma: parse_chroma(&d.chroma) as i32,
@@ -224,9 +216,11 @@ impl App {
         }
     }
 
-    /// Virtual display request for `mode` from the settings and this window.
-    fn vd_request(&self, mode: pb::DisplayMode, fullscreen: bool) -> Option<pb::VirtualDisplay> {
-        if mode == pb::DisplayMode::Physical {
+    /// Display setup for the host from these choices, the size settings and
+    /// this window. `None` = the host's displays as they are.
+    fn setup_request(&self, c: DisplayChoice, fullscreen: bool) -> Option<pb::DisplaySetup> {
+        let count = c.count.min(4);
+        if count == 0 && !c.block_input {
             return None;
         }
         let d = &self.cfg.defaults;
@@ -242,27 +236,32 @@ impl App {
         };
         let (width, height) = vd_dims(width, height);
         let refresh_hz = monitor.and_then(|m| m.refresh_rate_millihertz()).map(|mhz| (mhz + 500) / 1000).unwrap_or(60);
-        Some(pb::VirtualDisplay {
-            mode: mode as i32,
+        let screen = pb::VirtualScreen {
             width,
             height,
             refresh_hz,
             scale_percent: if d.vd_scale { (w.scale_factor() * 100.0).round() as u32 } else { 0 },
+        };
+        Some(pb::DisplaySetup {
+            virtual_screens: vec![screen; count as usize],
+            physical_off: c.physical_off && count > 0,
+            block_local_input: c.block_input,
         })
     }
 
-    /// The window size settled: fit the virtual display to it.
+    /// The window size settled: fit the virtual screens to it.
     fn fit_virtual_display(&mut self) {
         let Some(s) = self.session.as_ref() else { return };
-        if !s.vd_follow_window || s.display_mode() == pb::DisplayMode::Physical {
+        let choice = s.display_choice();
+        if !s.vd_follow_window || choice.count == 0 {
             return;
         }
         if self.window.as_ref().is_some_and(|w| w.is_minimized() == Some(true) || w.inner_size().width == 0) {
             return;
         }
-        let vd = self.vd_request(s.display_mode(), self.fullscreen);
+        let setup = self.setup_request(choice, self.fullscreen);
         if let Some(s) = self.session.as_mut() {
-            s.set_virtual_display(vd);
+            s.set_display_setup(setup);
         }
     }
 
@@ -379,7 +378,8 @@ impl App {
         let caps = caps::detect(&dev, d.hw_decode, if d.max_fps > 0 { d.max_fps } else { monitor_fps });
         tracing::info!("decoders: {:?}", caps.decoders.iter().map(|c| (c.codec, c.chroma, c.hardware)).collect::<Vec<_>>());
         let vd_supported = link.neg.has(pb::Feature::VirtualDisplay);
-        let vd = if vd_supported { self.vd_request(parse_display_mode(&d.display_mode), d.fullscreen) } else { None };
+        let choice = DisplayChoice { count: d.vd_count, physical_off: d.physical_off, block_input: d.block_input };
+        let vd = if vd_supported { self.setup_request(choice, d.fullscreen) } else { None };
         let params = Params {
             addr: link.conn.remote_address(),
             pinned: link.server_fp,
@@ -577,10 +577,10 @@ impl App {
                         s.set_game_mode(g);
                     }
                 }
-                Action::SetDisplayMode(mode) => {
-                    let vd = self.vd_request(mode, self.fullscreen);
+                Action::SetDisplayChoice(choice) => {
+                    let setup = self.setup_request(choice, self.fullscreen);
                     if let Some(s) = &mut self.session {
-                        s.set_virtual_display(vd);
+                        s.set_display_setup(setup);
                     }
                 }
                 Action::SelectDisplay(id) => {
