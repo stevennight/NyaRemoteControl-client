@@ -87,6 +87,146 @@ fn size_text(b: u64) -> String {
     }
 }
 
+const DIM: Color32 = Color32::from_rgb(0x9a, 0xa0, 0xab);
+const OK: Color32 = Color32::from_rgb(0x3c, 0xcf, 0x8e);
+const DANGER: Color32 = Color32::from_rgb(0xff, 0x8f, 0x86);
+
+fn bar_separator(ui: &mut egui::Ui) {
+    ui.add_space(4.0);
+    let (r, _) = ui.allocate_exact_size(egui::vec2(1.0, 20.0), egui::Sense::hover());
+    ui.painter().rect_filled(r, 0.0, Color32::from_white_alpha(30));
+    ui.add_space(4.0);
+}
+
+/// Current display, e.g. "屏幕 2 · 虚拟".
+fn display_title(s: &Session) -> String {
+    let Some(info) = &s.info else { return "显示器".into() };
+    let current = s.stream.as_ref().map(|x| x.display_id).unwrap_or(s.start.display_id);
+    match info.displays.iter().position(|d| d.id == current) {
+        Some(i) => format!("屏幕 {}{}", i + 1, if info.displays[i].is_virtual { " · 虚拟" } else { "" }),
+        None => "显示器".into(),
+    }
+}
+
+/// Host displays to switch to, then the display setup (virtual screens, privacy).
+fn displays_menu(ui: &mut egui::Ui, s: &Session, actions: &mut Vec<Action>) {
+    ui.set_min_width(330.0);
+    ui.label(RichText::new("被控端的显示器").small().color(DIM));
+    if let Some(info) = &s.info {
+        let current = s.stream.as_ref().map(|x| x.display_id).unwrap_or(s.start.display_id);
+        for (i, d) in info.displays.iter().enumerate() {
+            let text = format!(
+                "屏幕 {} · {}{}   {}×{}{}",
+                i + 1,
+                if d.is_virtual { "虚拟" } else { "物理" },
+                if d.primary { " · 主" } else { "" },
+                d.width,
+                d.height,
+                if d.hdr { " · HDR→SDR" } else { "" }
+            );
+            if ui.selectable_label(d.id == current, text).clicked() && d.id != current {
+                actions.push(Action::SelectDisplay(d.id));
+                ui.close_menu();
+            }
+        }
+    }
+    ui.separator();
+    ui.label(RichText::new("显示设置").small().color(DIM));
+    if s.vd_available() {
+        let current = s.display_choice();
+        let mut c = current;
+        if display_choice_ui(ui, &mut c) {
+            actions.push(Action::SetDisplayChoice(c));
+        }
+        ui.horizontal(|ui| {
+            let private = crate::session::DisplayChoice { count: current.count.max(1), physical_off: true, block_input: true };
+            if ui
+                .add_enabled(current != private, egui::Button::new("一键隐私屏"))
+                .on_hover_text("虚拟显示器 + 被控端物理显示器黑屏 + 屏蔽本地键鼠")
+                .clicked()
+            {
+                actions.push(Action::SetDisplayChoice(private));
+                ui.close_menu();
+            }
+            if ui.add_enabled(current != Default::default(), egui::Button::new("恢复被控端原样")).clicked() {
+                actions.push(Action::SetDisplayChoice(Default::default()));
+                ui.close_menu();
+            }
+        });
+    } else if s.info.is_some() {
+        ui.label(
+            RichText::new(if s.vd_supported {
+                "被控端没有安装虚拟显示器（在被控端管理程序“可选组件”中安装）"
+            } else {
+                "被控端版本太旧，不支持虚拟显示器"
+            })
+            .color(DIM),
+        );
+    }
+}
+
+/// Less frequent session controls.
+fn more_menu(ui: &mut egui::Ui, s: &Session, actions: &mut Vec<Action>) {
+    ui.set_min_width(230.0);
+    let mut stats = s.show_stats;
+    if ui.toggle_value(&mut stats, "统计信息").on_hover_text("Ctrl+Alt+Shift+S").changed() {
+        actions.push(Action::Hotkey(Hotkey::ToggleStats));
+    }
+    let mut rel = s.relative;
+    if ui.toggle_value(&mut rel, "相对鼠标（游戏）").on_hover_text("鼠标锁在窗口内，Ctrl+Alt+Shift+R").changed() {
+        actions.push(Action::Hotkey(Hotkey::ToggleRelative));
+    }
+    let mut mic = s.mic_on();
+    match s.host_mic_device() {
+        Some(dev) => {
+            if ui
+                .toggle_value(&mut mic, "麦克风")
+                .on_hover_text(format!("本机麦克风 → 被控端“{dev}”。被控端软件请选择 CABLE Output 作为麦克风"))
+                .changed()
+            {
+                actions.push(Action::SetMic(mic));
+            }
+        }
+        None => {
+            ui.add_enabled(false, egui::Button::new("麦克风"))
+                .on_disabled_hover_text("被控端没有安装虚拟声卡（可在被控端管理程序“可选组件”中安装）");
+        }
+    }
+    if s.usb_available() {
+        let mut open = s.usb_open;
+        if ui.toggle_value(&mut open, "USB 设备透传…").changed() {
+            actions.push(Action::ToggleUsb);
+            ui.close_menu();
+        }
+    }
+    if let Some(g) = &s.gamepads {
+        let n = g.count();
+        if n > 0 {
+            ui.label(RichText::new(format!("手柄 ×{n} 已映射为被控端 Xbox 手柄")).color(OK));
+        }
+    }
+    ui.separator();
+    if ui.button("发送文件…").on_hover_text("也可以直接把文件拖进窗口").clicked() {
+        actions.push(Action::PickFiles);
+        ui.close_menu();
+    }
+    if ui.button("发送 Ctrl+Alt+Del").on_hover_text("Ctrl+Alt+Shift+D，需要被控端以服务模式运行").clicked() {
+        actions.push(Action::Hotkey(Hotkey::CtrlAltDel));
+        ui.close_menu();
+    }
+    ui.separator();
+    let current = s.bitrate_policy();
+    let cur_key = POLICIES.iter().find(|p| parse_policy(p.0) as i32 == current).map(|p| p.0).unwrap_or("auto");
+    ui.menu_button(format!("网络变差时：{}", policy_label(cur_key)), |ui| {
+        for (key, name, tip) in POLICIES {
+            if ui.selectable_label(key == cur_key, name).on_hover_text(tip).clicked() {
+                actions.push(Action::SetPolicy(parse_policy(key)));
+                ui.close_menu();
+            }
+        }
+    });
+}
+
 /// Toolbar and statistics shown over the remote picture.
 pub fn session_overlay(
     ctx: &egui::Context,
@@ -111,143 +251,59 @@ pub fn session_overlay(
     }
 
     let bar = egui::Area::new(egui::Id::new("toolbar"))
-        .anchor(Align2::CENTER_TOP, [0.0, 0.0])
+        .anchor(Align2::CENTER_TOP, [0.0, if show_bar { 8.0 } else { 0.0 }])
         .order(egui::Order::Foreground)
         .show(ctx, |ui| {
-            egui::Frame::popup(ui.style()).inner_margin(egui::Margin::symmetric(10, 4)).show(ui, |ui| {
-                if !show_bar {
-                    // A thin handle; hovering the top edge (or Ctrl+Alt+Shift+T) opens the bar.
-                    ui.label(RichText::new(format!("▾ {}", s.label)).small().weak());
-                    return;
+            let frame = egui::Frame::NONE
+                .fill(Color32::from_rgba_unmultiplied(28, 30, 36, 235))
+                .stroke(egui::Stroke::new(1.0_f32, Color32::from_white_alpha(18)))
+                .shadow(ui.visuals().popup_shadow);
+            if !show_bar {
+                // A thin tab at the top edge; hovering it (or Ctrl+Alt+Shift+T) opens the bar.
+                frame
+                    .corner_radius(egui::CornerRadius { nw: 0, ne: 0, sw: 8, se: 8 })
+                    .inner_margin(egui::Margin::symmetric(12, 2))
+                    .show(ui, |ui| ui.label(RichText::new(format!("▾ {}", s.label)).small().color(DIM)));
+                return;
+            }
+            frame.corner_radius(12).inner_margin(egui::Margin::same(4)).show(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                ui.spacing_mut().button_padding = egui::vec2(9.0, 5.0);
+                {
+                    // Flat buttons on the bar; menus keep the normal look.
+                    let w = &mut ui.visuals_mut().widgets;
+                    w.inactive.weak_bg_fill = Color32::TRANSPARENT;
+                    w.inactive.bg_fill = Color32::TRANSPARENT;
+                    w.hovered.weak_bg_fill = Color32::from_white_alpha(22);
+                    w.hovered.bg_fill = Color32::from_white_alpha(22);
                 }
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(&s.label).strong());
-                    ui.separator();
+                    ui.add_space(8.0);
+                    let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                    ui.painter().circle_filled(dot.center(), 3.5, OK);
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(&s.label).strong().color(Color32::WHITE));
+                    bar_separator(ui);
 
-                    if let Some(info) = &s.info {
-                        let current = s.stream.as_ref().map(|x| x.display_id).unwrap_or(s.start.display_id);
-                        let idx = info.displays.iter().position(|d| d.id == current).map(|i| i + 1).unwrap_or(0);
-                        egui::ComboBox::from_id_salt("display").selected_text(format!("显示器 {idx}")).show_ui(ui, |ui| {
-                            for (i, d) in info.displays.iter().enumerate() {
-                                let text = format!(
-                                    "{} · {}x{}{}{}{}",
-                                    i + 1,
-                                    d.width,
-                                    d.height,
-                                    if d.primary { " · 主" } else { "" },
-                                    if d.is_virtual { " · 虚拟" } else { "" },
-                                    if d.hdr { " · HDR" } else { "" }
-                                );
-                                if ui.selectable_label(d.id == current, text).clicked() {
-                                    actions.push(Action::SelectDisplay(d.id));
-                                }
-                            }
-                        });
-                    }
-                    if s.vd_available() {
-                        let current = s.display_choice();
-                        let label = match (current.count, current.physical_off, current.block_input) {
-                            (0, _, false) => "显示设置".to_string(),
-                            (n, true, true) if n > 0 => "隐私屏".to_string(),
-                            (0, _, true) => "已屏蔽本地键鼠".to_string(),
-                            (n, off, _) => format!("虚拟屏 ×{n}{}", if off { "（物理屏关）" } else { "" }),
-                        };
-                        ui.menu_button(format!("🖵 {label}"), |ui| {
-                            ui.set_min_width(300.0);
-                            let mut c = current;
-                            if display_choice_ui(ui, &mut c) {
-                                actions.push(Action::SetDisplayChoice(c));
-                            }
-                            ui.separator();
-                            ui.horizontal(|ui| {
-                                if ui.button("隐私屏").on_hover_text("1 个虚拟显示器 + 物理显示器黑屏 + 屏蔽本地键鼠").clicked() {
-                                    let c = crate::session::DisplayChoice { count: current.count.max(1), physical_off: true, block_input: true };
-                                    actions.push(Action::SetDisplayChoice(c));
-                                    ui.close_menu();
-                                }
-                                if ui.button("恢复被控端原样").clicked() {
-                                    actions.push(Action::SetDisplayChoice(Default::default()));
-                                    ui.close_menu();
-                                }
-                            });
-                        });
-                    } else if s.info.is_some() {
-                        ui.add_enabled(false, egui::Button::new("虚拟显示器")).on_disabled_hover_text(if s.vd_supported {
-                            "被控端没有安装虚拟显示器驱动（在被控端管理界面“可选组件”中安装）"
-                        } else {
-                            "被控端版本太旧，不支持虚拟显示器"
-                        });
-                    }
-                    let mut game = s.game;
-                    ui.selectable_value(&mut game, false, "办公");
-                    ui.selectable_value(&mut game, true, "游戏");
-                    if game != s.game {
-                        actions.push(Action::SetGameMode(game));
-                    }
-                    let current = s.bitrate_policy();
-                    let cur_key = POLICIES.iter().find(|p| parse_policy(p.0) as i32 == current).map(|p| p.0).unwrap_or("auto");
-                    egui::ComboBox::from_id_salt("policy-bar").selected_text(policy_label(cur_key)).show_ui(ui, |ui| {
-                        for (key, name, tip) in POLICIES {
-                            if ui.selectable_label(key == cur_key, name).on_hover_text(tip).clicked() {
-                                actions.push(Action::SetPolicy(parse_policy(key)));
-                            }
-                        }
-                    });
-                    ui.separator();
+                    ui.menu_button(format!("{} ▾", display_title(s)), |ui| displays_menu(ui, s, actions))
+                        .response
+                        .on_hover_text("被控端的显示器、虚拟显示器和隐私屏");
 
-                    let mut mic = s.mic_on();
-                    match s.host_mic_device() {
-                        Some(dev) => {
-                            if ui
-                                .toggle_value(&mut mic, "🎤 麦克风")
-                                .on_hover_text(format!("本机麦克风 → 被控端“{dev}”。被控端软件请选择 CABLE Output 作为麦克风"))
-                                .changed()
-                            {
-                                actions.push(Action::SetMic(mic));
-                            }
-                        }
-                        None => {
-                            ui.add_enabled(false, egui::Button::new("🎤 麦克风"))
-                                .on_disabled_hover_text("被控端没有安装虚拟声卡 VB-Cable（可在被控端管理界面“可选组件”中查看）");
-                        }
-                    }
-                    if let Some(g) = &s.gamepads {
-                        let n = g.count();
-                        if n > 0 {
-                            ui.label(RichText::new(format!("🎮 {n}")).color(Color32::LIGHT_GREEN))
-                                .on_hover_text("本机手柄已映射为被控端的 Xbox 手柄（窗口在前台时生效）");
-                        }
+                    let mode = if s.game { "游戏" } else { "办公" };
+                    if ui.button(mode).on_hover_text("办公（清晰）/ 游戏（流畅）切换，Ctrl+Alt+Shift+M").clicked() {
+                        actions.push(Action::SetGameMode(!s.game));
                     }
                     let mut grab = input::grabbed();
-                    if ui.toggle_value(&mut grab, "键盘捕获").on_hover_text("Ctrl+Alt+Shift+Q").changed() {
+                    if ui.toggle_value(&mut grab, "键盘").on_hover_text("捕获键盘：Win 键等组合键发给被控端，Ctrl+Alt+Shift+Q").changed() {
                         actions.push(Action::SetGrab(grab));
-                    }
-                    let mut rel = s.relative;
-                    if ui.toggle_value(&mut rel, "相对鼠标").on_hover_text("游戏用，Ctrl+Alt+Shift+R").changed() {
-                        actions.push(Action::Hotkey(Hotkey::ToggleRelative));
                     }
                     let mut fs = fullscreen;
                     if ui.toggle_value(&mut fs, "全屏").on_hover_text("Ctrl+Alt+Shift+F").changed() {
                         actions.push(Action::Hotkey(Hotkey::ToggleFullscreen));
                     }
-                    let mut stats = s.show_stats;
-                    if ui.toggle_value(&mut stats, "统计").on_hover_text("Ctrl+Alt+Shift+S").changed() {
-                        actions.push(Action::Hotkey(Hotkey::ToggleStats));
-                    }
-                    if s.usb_available() {
-                        let mut open = s.usb_open;
-                        if ui.toggle_value(&mut open, "USB 设备").on_hover_text("把本机 USB 设备透传到被控端").changed() {
-                            actions.push(Action::ToggleUsb);
-                        }
-                    }
-                    if ui.button("发送文件…").on_hover_text("也可以直接把文件拖进窗口").clicked() {
-                        actions.push(Action::PickFiles);
-                    }
-                    if ui.button("Ctrl+Alt+Del").on_hover_text("Ctrl+Alt+Shift+D").clicked() {
-                        actions.push(Action::Hotkey(Hotkey::CtrlAltDel));
-                    }
-                    ui.separator();
-                    if ui.button(RichText::new("断开").color(Color32::from_rgb(255, 140, 130))).clicked() {
+                    ui.menu_button("⋯", |ui| more_menu(ui, s, actions)).response.on_hover_text("更多");
+                    bar_separator(ui);
+                    if ui.button(RichText::new("断开").color(DANGER)).on_hover_text("Ctrl+Alt+Shift+X").clicked() {
                         actions.push(Action::Disconnect);
                     }
                 });
@@ -263,9 +319,13 @@ pub fn session_overlay(
             .order(egui::Order::Foreground)
             .interactable(false)
             .show(ctx, |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.label(&s.status);
-                });
+                egui::Frame::NONE
+                    .fill(Color32::from_rgba_unmultiplied(28, 30, 36, 235))
+                    .corner_radius(10)
+                    .inner_margin(egui::Margin::symmetric(14, 8))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new(&s.status).color(Color32::WHITE));
+                    });
             });
     }
 
