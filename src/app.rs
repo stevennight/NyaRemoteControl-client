@@ -67,6 +67,8 @@ pub struct App {
     hovering_file: bool,
     /// Files dropped on the window, sent together once the drop is complete.
     dropped: Vec<PathBuf>,
+    /// Window resized: resize the host's virtual display at this time.
+    vd_resize_at: Option<Instant>,
 }
 
 fn hwnd(window: &Window) -> Option<windows::Win32::Foundation::HWND> {
@@ -109,10 +111,25 @@ fn parse_chroma(s: &str) -> pb::Chroma {
 /// uses what it needs.
 const UNLIMITED_KBPS: u32 = 80_000;
 
-fn start_request(d: &Defaults) -> pb::StartStream {
+fn parse_display_mode(s: &str) -> pb::DisplayMode {
+    match s {
+        "virtual" => pb::DisplayMode::Virtual,
+        "private" => pb::DisplayMode::Private,
+        _ => pb::DisplayMode::Physical,
+    }
+}
+
+/// Virtual display sizes: width a multiple of 8, height even, at least 640x480.
+fn vd_dims(w: u32, h: u32) -> (u32, u32) {
+    ((w & !7).max(640), (h & !1).max(480))
+}
+
+fn start_request(d: &Defaults, vd: Option<pb::VirtualDisplay>) -> pb::StartStream {
     let game = d.mode.eq_ignore_ascii_case("game");
     pb::StartStream {
-        display_id: d.display,
+        // A virtual display is streamed as the host's primary display.
+        display_id: if vd.is_some() { 0 } else { d.display },
+        virtual_display: vd,
         config: Some(pb::StreamConfig {
             codec: parse_codec(&d.codec) as i32,
             chroma: parse_chroma(&d.chroma) as i32,
@@ -165,6 +182,7 @@ impl App {
             exit: false,
             hovering_file: false,
             dropped: Vec::new(),
+            vd_resize_at: None,
         }
     }
 
@@ -203,6 +221,48 @@ impl App {
                 }
             }
             Err(e) => tracing::error!("D3D device: {e:#}"),
+        }
+    }
+
+    /// Virtual display request for `mode` from the settings and this window.
+    fn vd_request(&self, mode: pb::DisplayMode, fullscreen: bool) -> Option<pb::VirtualDisplay> {
+        if mode == pb::DisplayMode::Physical {
+            return None;
+        }
+        let d = &self.cfg.defaults;
+        let w = self.window.as_ref()?;
+        let monitor = w.current_monitor();
+        let monitor_size = monitor.as_ref().map(|m| (m.size().width, m.size().height)).unwrap_or((1920, 1080));
+        let (width, height) = match d.vd_size.as_str() {
+            "fixed" => (d.vd_width, d.vd_height),
+            "screen" => monitor_size,
+            // Follow the window; fullscreen means the whole monitor.
+            _ if fullscreen => monitor_size,
+            _ => (w.inner_size().width, w.inner_size().height),
+        };
+        let (width, height) = vd_dims(width, height);
+        let refresh_hz = monitor.and_then(|m| m.refresh_rate_millihertz()).map(|mhz| (mhz + 500) / 1000).unwrap_or(60);
+        Some(pb::VirtualDisplay {
+            mode: mode as i32,
+            width,
+            height,
+            refresh_hz,
+            scale_percent: if d.vd_scale { (w.scale_factor() * 100.0).round() as u32 } else { 0 },
+        })
+    }
+
+    /// The window size settled: fit the virtual display to it.
+    fn fit_virtual_display(&mut self) {
+        let Some(s) = self.session.as_ref() else { return };
+        if !s.vd_follow_window || s.display_mode() == pb::DisplayMode::Physical {
+            return;
+        }
+        if self.window.as_ref().is_some_and(|w| w.is_minimized() == Some(true) || w.inner_size().width == 0) {
+            return;
+        }
+        let vd = self.vd_request(s.display_mode(), self.fullscreen);
+        if let Some(s) = self.session.as_mut() {
+            s.set_virtual_display(vd);
         }
     }
 
@@ -318,16 +378,22 @@ impl App {
             .unwrap_or(60);
         let caps = caps::detect(&dev, d.hw_decode, if d.max_fps > 0 { d.max_fps } else { monitor_fps });
         tracing::info!("decoders: {:?}", caps.decoders.iter().map(|c| (c.codec, c.chroma, c.hardware)).collect::<Vec<_>>());
+        let vd_supported = link.neg.has(pb::Feature::VirtualDisplay);
+        let vd = if vd_supported { self.vd_request(parse_display_mode(&d.display_mode), d.fullscreen) } else { None };
         let params = Params {
             addr: link.conn.remote_address(),
             pinned: link.server_fp,
             identity: self.identity.clone(),
             name: self.client_name.clone(),
             caps,
-            start: start_request(&d),
+            start: start_request(&d, vd),
         };
         let opts = SessionOptions { hw_decode: d.hw_decode, audio: d.audio, clipboard: d.clipboard };
-        self.session = Some(Session::start(&self.rt, *link, params, &dev, &opts, self.ui_tx.clone(), label));
+        let mut session = Session::start(&self.rt, *link, params, &dev, &opts, self.ui_tx.clone(), label);
+        session.vd_supported = vd_supported;
+        session.vd_follow_window = d.vd_size == "window";
+        self.session = Some(session);
+        self.vd_resize_at = None;
         self.toolbar_open = false;
         self.launcher.notice = None;
         if d.fullscreen {
@@ -491,6 +557,15 @@ impl App {
                         let _ = self.cfg.save(&self.data_dir);
                     }
                 }
+                Action::RenameHost(i, name) => match self.cfg.rename(i, &name) {
+                    Ok(()) => {
+                        self.launcher.rename = None;
+                        if let Err(e) = self.cfg.save(&self.data_dir) {
+                            self.launcher.notice = Some(Notice::Error(format!("保存失败：{e:#}")));
+                        }
+                    }
+                    Err(e) => self.launcher.rename_error = Some(e.into()),
+                },
                 Action::SaveConfig => {
                     if let Err(e) = self.cfg.save(&self.data_dir) {
                         self.launcher.notice = Some(Notice::Error(format!("保存失败：{e:#}")));
@@ -500,6 +575,12 @@ impl App {
                 Action::SetGameMode(g) => {
                     if let Some(s) = &mut self.session {
                         s.set_game_mode(g);
+                    }
+                }
+                Action::SetDisplayMode(mode) => {
+                    let vd = self.vd_request(mode, self.fullscreen);
+                    if let Some(s) = &mut self.session {
+                        s.set_virtual_display(vd);
                     }
                 }
                 Action::SelectDisplay(id) => {
@@ -910,6 +991,10 @@ impl ApplicationHandler<UiEvent> for App {
                         tracing::warn!("resize: {e:#}");
                     }
                 }
+                if self.session.as_ref().is_some_and(|s| s.vd_follow_window) {
+                    // Wait until resizing stops: a size the driver does not offer yet restarts it.
+                    self.vd_resize_at = Some(Instant::now() + Duration::from_millis(800));
+                }
                 self.draw();
             }
             WindowEvent::RedrawRequested => self.draw(),
@@ -1043,8 +1128,14 @@ impl ApplicationHandler<UiEvent> for App {
                         );
                         s.game = st.config.as_ref().is_some_and(|c| c.mode == pb::StreamMode::Game as i32);
                         s.stream = Some(st);
-                        s.status.clear();
+                        if s.status_until.is_none() {
+                            s.status.clear();
+                        }
                         s.cursor_shape = 0;
+                    }
+                    UiEvent::StreamError(e) if e.starts_with("虚拟显示器") => {
+                        tracing::error!("{e}");
+                        s.virtual_display_failed(&e);
                     }
                     UiEvent::StreamError(e) => {
                         tracing::error!("stream error: {e}");
@@ -1088,11 +1179,17 @@ impl ApplicationHandler<UiEvent> for App {
             self.repaint_at = None;
             redraw = true;
         }
+        if self.vd_resize_at.is_some_and(|t| Instant::now() >= t) {
+            self.vd_resize_at = None;
+            self.fit_virtual_display();
+            redraw = true;
+        }
         if redraw {
             self.request_redraw();
         }
         let next = Instant::now() + Duration::from_millis(250);
         let wake = self.repaint_at.map_or(next, |t| t.min(next));
+        let wake = self.vd_resize_at.map_or(wake, |t| t.min(wake));
         el.set_control_flow(ControlFlow::WaitUntil(wake));
     }
 }

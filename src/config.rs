@@ -43,6 +43,14 @@ pub struct Defaults {
     pub clipboard: bool,
     /// Use hardware decoding when possible.
     pub hw_decode: bool,
+    /// "physical" | "virtual" | "private" (virtual display only, host screens dark)
+    pub display_mode: String,
+    /// Virtual display size: "window" (follows this window) | "screen" | "fixed"
+    pub vd_size: String,
+    pub vd_width: u32,
+    pub vd_height: u32,
+    /// Give the virtual display this computer's display scaling.
+    pub vd_scale: bool,
 }
 
 impl Default for Defaults {
@@ -61,6 +69,11 @@ impl Default for Defaults {
             audio: true,
             clipboard: true,
             hw_decode: true,
+            display_mode: "physical".into(),
+            vd_size: "window".into(),
+            vd_width: 1920,
+            vd_height: 1080,
+            vd_scale: true,
         }
     }
 }
@@ -96,11 +109,64 @@ impl ClientConfig {
         self.hosts.iter().find(|h| h.name == key || h.address == key)
     }
 
-    pub fn upsert(&mut self, entry: HostEntry) {
-        if let Some(h) = self.hosts.iter_mut().find(|h| h.address == entry.address || h.name == entry.name) {
-            *h = entry;
-        } else {
-            self.hosts.push(entry);
+    /// Rename host `i`. Names are how hosts are picked on the command line, so
+    /// they must stay non-empty and unique.
+    pub fn rename(&mut self, i: usize, name: &str) -> Result<(), &'static str> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("名称不能为空");
         }
+        if self.hosts.iter().enumerate().any(|(j, h)| j != i && (h.name == name || h.address == name)) {
+            return Err("已有同名的被控端");
+        }
+        let h = self.hosts.get_mut(i).ok_or("被控端不存在")?;
+        h.name = name.to_owned();
+        Ok(())
+    }
+
+    /// Save a host after connecting. Matched by address; a name that another
+    /// host already uses gets a number appended instead of replacing it.
+    pub fn upsert(&mut self, mut entry: HostEntry) {
+        if let Some(i) = self.hosts.iter().position(|h| h.address == entry.address) {
+            let name_free = !entry.name.trim().is_empty() && !self.hosts.iter().any(|o| o.name == entry.name.trim());
+            let h = &mut self.hosts[i];
+            h.fingerprint = entry.fingerprint;
+            if name_free {
+                h.name = entry.name.trim().to_owned();
+            }
+            return;
+        }
+        let base = if entry.name.trim().is_empty() { entry.address.clone() } else { entry.name.trim().to_owned() };
+        entry.name = base.clone();
+        let mut n = 2;
+        while self.hosts.iter().any(|h| h.name == entry.name) {
+            entry.name = format!("{base} ({n})");
+            n += 1;
+        }
+        self.hosts.push(entry);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn host(name: &str, address: &str) -> HostEntry {
+        HostEntry { name: name.into(), address: address.into(), fingerprint: String::new() }
+    }
+
+    #[test]
+    fn upsert_and_rename() {
+        let mut c = ClientConfig::default();
+        c.upsert(host("pc", "10.0.0.1"));
+        c.upsert(host("pc", "10.0.0.2"));
+        assert_eq!(c.hosts[1].name, "pc (2)");
+        // Reconnecting keeps a user-chosen name.
+        c.rename(0, " office ").unwrap();
+        c.upsert(HostEntry { fingerprint: "ab".into(), ..host("pc (2)", "10.0.0.1") });
+        assert_eq!((c.hosts[0].name.as_str(), c.hosts[0].fingerprint.as_str()), ("office", "ab"));
+        assert!(c.rename(0, "pc (2)").is_err());
+        assert!(c.rename(0, "  ").is_err());
+        assert!(c.rename(1, "10.0.0.1").is_err());
     }
 }

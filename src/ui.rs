@@ -19,10 +19,12 @@ pub enum Action {
     /// Fingerprint check after re-verification without pairing.
     FingerprintOk(bool),
     DeleteHost(usize),
+    RenameHost(usize, String),
     SaveConfig,
     Hotkey(Hotkey),
     SetGameMode(bool),
     SelectDisplay(u32),
+    SetDisplayMode(nya_proto::pb::DisplayMode),
     SetGrab(bool),
     SetPolicy(nya_proto::pb::BitratePolicy),
     SetMic(bool),
@@ -62,6 +64,40 @@ fn policy_label(s: &str) -> &'static str {
     POLICIES.iter().find(|p| p.0 == s).map(|p| p.1).unwrap_or("自动")
 }
 
+const DISPLAY_MODES: [(&str, &str, &str); 3] = [
+    ("physical", "物理显示器", "直接传输被控端现有的显示器，被控端屏幕照常显示"),
+    (
+        "virtual",
+        "虚拟显示器",
+        "被控端新增一个虚拟显示器（设为主显示器），分辨率按下面的设置；物理显示器照常显示，可以当扩展屏用。需要被控端安装“虚拟显示器”组件",
+    ),
+    (
+        "private",
+        "隐私屏",
+        "只保留虚拟显示器：被控端的物理显示器黑屏（无信号），本地键盘鼠标被屏蔽，旁人看不到也操作不了。断开后自动恢复。需要被控端安装“虚拟显示器”组件，并以服务模式运行",
+    ),
+];
+
+fn display_mode_key(m: nya_proto::pb::DisplayMode) -> &'static str {
+    match m {
+        nya_proto::pb::DisplayMode::Virtual => "virtual",
+        nya_proto::pb::DisplayMode::Private => "private",
+        nya_proto::pb::DisplayMode::Physical => "physical",
+    }
+}
+
+fn parse_display_mode(s: &str) -> nya_proto::pb::DisplayMode {
+    match s {
+        "virtual" => nya_proto::pb::DisplayMode::Virtual,
+        "private" => nya_proto::pb::DisplayMode::Private,
+        _ => nya_proto::pb::DisplayMode::Physical,
+    }
+}
+
+fn display_mode_label(s: &str) -> &'static str {
+    DISPLAY_MODES.iter().find(|m| m.0 == s).map(|m| m.1).unwrap_or("物理显示器")
+}
+
 fn size_text(b: u64) -> String {
     match b {
         b if b >= 1 << 30 => format!("{:.2} GB", b as f64 / (1u64 << 30) as f64),
@@ -88,6 +124,9 @@ pub struct LauncherState {
     /// Fingerprint to confirm by eye.
     pub verify_fingerprint: Option<String>,
     pub confirm_delete: Option<usize>,
+    /// Host being renamed and the name being typed.
+    pub rename: Option<(usize, String)>,
+    pub rename_error: Option<String>,
     pub settings_dirty: bool,
 }
 
@@ -104,7 +143,11 @@ fn dialog(title: &str) -> egui::Window<'_> {
 }
 
 pub fn launcher(ctx: &egui::Context, st: &mut LauncherState, cfg: &mut ClientConfig, actions: &mut Vec<Action>) {
-    let busy = st.connecting.is_some() || st.pairing.is_some() || st.pin_changed || st.verify_fingerprint.is_some();
+    let busy = st.connecting.is_some()
+        || st.pairing.is_some()
+        || st.pin_changed
+        || st.verify_fingerprint.is_some()
+        || st.rename.is_some();
     egui::CentralPanel::default()
         .frame(egui::Frame::central_panel(&ctx.style()).inner_margin(28.0))
         .show(ctx, |ui| {
@@ -149,8 +192,12 @@ pub fn launcher(ctx: &egui::Context, st: &mut LauncherState, cfg: &mut ClientCon
                                     if ui.button("删除").clicked() {
                                         st.confirm_delete = Some(i);
                                     }
+                                    if ui.button("改名").clicked() {
+                                        st.rename = Some((i, h.name.clone()));
+                                        st.rename_error = None;
+                                    }
                                     if ui.button(RichText::new("连接").strong()).clicked() {
-                                        actions.push(Action::Connect { target: h.name.clone(), name: None });
+                                        actions.push(Action::Connect { target: h.address.clone(), name: Some(h.name.clone()) });
                                     }
                                 });
                             });
@@ -259,6 +306,35 @@ pub fn launcher(ctx: &egui::Context, st: &mut LauncherState, cfg: &mut ClientCon
         });
     }
 
+    if let Some((i, name)) = &mut st.rename {
+        let i = *i;
+        let mut close = false;
+        dialog("修改名称").show(ctx, |ui| {
+            let addr = cfg.hosts.get(i).map(|h| h.address.as_str()).unwrap_or("");
+            ui.label(RichText::new(format!("地址 {addr}")).weak());
+            let r = ui.add(egui::TextEdit::singleline(name).desired_width(340.0));
+            if !r.has_focus() && !r.lost_focus() {
+                r.request_focus();
+            }
+            if let Some(e) = &st.rename_error {
+                ui.label(RichText::new(e).color(Color32::from_rgb(255, 120, 110)));
+            }
+            ui.horizontal(|ui| {
+                let submit = ui.button(RichText::new("保存").strong()).clicked()
+                    || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                if submit {
+                    actions.push(Action::RenameHost(i, name.clone()));
+                }
+                if ui.button("取消").clicked() {
+                    close = true;
+                }
+            });
+        });
+        if close {
+            st.rename = None;
+        }
+    }
+
     if let Some(i) = st.confirm_delete {
         let name = cfg.hosts.get(i).map(|h| h.name.clone()).unwrap_or_default();
         dialog("删除被控端").show(ctx, |ui| {
@@ -348,6 +424,39 @@ fn settings(ui: &mut egui::Ui, d: &mut Defaults) -> bool {
         });
         ui.end_row();
 
+        ui.label("被控端显示器");
+        ui.horizontal(|ui| {
+            for (key, name, tip) in DISPLAY_MODES {
+                ui.selectable_value(&mut d.display_mode, key.to_string(), name).on_hover_text(tip);
+            }
+        });
+        ui.end_row();
+
+        if d.display_mode != "physical" {
+            ui.label("虚拟显示器分辨率");
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut d.vd_size, "window".into(), "跟随窗口")
+                        .on_hover_text("和本窗口（全屏时为整个屏幕）一样大，调整窗口大小后自动跟随，画面 1:1 最清晰");
+                    ui.selectable_value(&mut d.vd_size, "screen".into(), "跟随本机屏幕");
+                    ui.selectable_value(&mut d.vd_size, "fixed".into(), "固定");
+                    if d.vd_size == "fixed" {
+                        ui.add(egui::DragValue::new(&mut d.vd_width).range(640..=7680).speed(8));
+                        ui.label("×");
+                        ui.add(egui::DragValue::new(&mut d.vd_height).range(480..=4320).speed(8));
+                    }
+                });
+                ui.checkbox(&mut d.vd_scale, "使用本机的缩放比例")
+                    .on_hover_text("例如本机是 150% 缩放，虚拟显示器也用 150%，文字大小和本机一致");
+                ui.label(
+                    RichText::new("不影响被控端物理显示器的分辨率。第一次用某个不常见的分辨率时，虚拟显示器会重启一下（约 2 秒）")
+                        .weak()
+                        .small(),
+                );
+            });
+            ui.end_row();
+        }
+
         ui.label("其他");
         ui.vertical(|ui| {
             ui.checkbox(&mut d.fullscreen, "连接后全屏");
@@ -429,11 +538,35 @@ pub fn session_overlay(
                         let idx = info.displays.iter().position(|d| d.id == current).map(|i| i + 1).unwrap_or(0);
                         egui::ComboBox::from_id_salt("display").selected_text(format!("显示器 {idx}")).show_ui(ui, |ui| {
                             for (i, d) in info.displays.iter().enumerate() {
-                                let text = format!("{} · {}x{}{}", i + 1, d.width, d.height, if d.primary { " · 主" } else { "" });
+                                let text = format!(
+                                    "{} · {}x{}{}{}{}",
+                                    i + 1,
+                                    d.width,
+                                    d.height,
+                                    if d.primary { " · 主" } else { "" },
+                                    if d.is_virtual { " · 虚拟" } else { "" },
+                                    if d.hdr { " · HDR" } else { "" }
+                                );
                                 if ui.selectable_label(d.id == current, text).clicked() {
                                     actions.push(Action::SelectDisplay(d.id));
                                 }
                             }
+                        });
+                    }
+                    let mode = display_mode_key(s.display_mode());
+                    if s.vd_available() {
+                        egui::ComboBox::from_id_salt("display-mode").selected_text(display_mode_label(mode)).show_ui(ui, |ui| {
+                            for (key, name, tip) in DISPLAY_MODES {
+                                if ui.selectable_label(key == mode, name).on_hover_text(tip).clicked() && key != mode {
+                                    actions.push(Action::SetDisplayMode(parse_display_mode(key)));
+                                }
+                            }
+                        });
+                    } else if s.info.is_some() {
+                        ui.add_enabled(false, egui::Button::new("虚拟显示器")).on_disabled_hover_text(if s.vd_supported {
+                            "被控端没有安装虚拟显示器驱动（在被控端管理界面“可选组件”中安装）"
+                        } else {
+                            "被控端版本太旧，不支持虚拟显示器"
                         });
                     }
 

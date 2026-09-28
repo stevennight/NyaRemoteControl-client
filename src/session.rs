@@ -65,6 +65,12 @@ pub struct Session {
     /// Current stream request (display, mode …), replayed on reconnect.
     pub start: pb::StartStream,
     pub status: String,
+    /// Clear `status` at this time (short notices).
+    pub status_until: Option<Instant>,
+    /// The host speaks FEATURE_VIRTUAL_DISPLAY.
+    pub vd_supported: bool,
+    /// Virtual display follows the window size.
+    pub vd_follow_window: bool,
     pub info: Option<pb::SessionInfo>,
     pub stream: Option<pb::StreamStarted>,
     pub server_stats: Option<pb::ServerStats>,
@@ -145,6 +151,9 @@ impl Session {
             offers: Vec::new(),
             start,
             status: "连接中".into(),
+            status_until: None,
+            vd_supported: false,
+            vd_follow_window: false,
             info: None,
             stream: None,
             server_stats: None,
@@ -217,6 +226,55 @@ impl Session {
         self.start.config.get_or_insert_with(Default::default).bitrate_policy = p as i32;
         let _ = self.net_tx.send(ctl(Msg::StartStream(self.start.clone())));
         self.status = "正在切换码率策略…".into();
+    }
+
+    pub fn display_mode(&self) -> pb::DisplayMode {
+        self.start
+            .virtual_display
+            .and_then(|v| pb::DisplayMode::try_from(v.mode).ok())
+            .unwrap_or(pb::DisplayMode::Physical)
+    }
+
+    /// Can the host create a virtual display?
+    pub fn vd_available(&self) -> bool {
+        self.vd_supported && self.info.as_ref().is_some_and(|i| i.virtual_display_available)
+    }
+
+    /// Change the host display setup (mode or virtual display size).
+    pub fn set_virtual_display(&mut self, vd: Option<pb::VirtualDisplay>) {
+        let vd = vd.filter(|v| v.mode != pb::DisplayMode::Physical as i32);
+        if self.start.virtual_display == vd {
+            return;
+        }
+        let was = self.display_mode();
+        self.start.virtual_display = vd;
+        let now = self.display_mode();
+        if now != was {
+            // The virtual display is the host's primary display while it exists.
+            self.start.display_id = 0;
+        }
+        let _ = self.net_tx.send(ctl(Msg::StartStream(self.start.clone())));
+        self.status = match (was == now, now) {
+            (true, _) => {
+                let v = vd.unwrap_or_default();
+                format!("正在调整被控端分辨率为 {}x{}…", v.width, v.height)
+            }
+            (false, pb::DisplayMode::Physical) => "正在恢复被控端的物理显示器…".into(),
+            (false, pb::DisplayMode::Virtual) => "正在创建虚拟显示器…".into(),
+            (false, pb::DisplayMode::Private) => "正在创建虚拟显示器，被控端屏幕将黑屏…".into(),
+        };
+    }
+
+    /// The host could not set up the virtual display and streams a physical
+    /// one instead: stop asking for it.
+    pub fn virtual_display_failed(&mut self, msg: &str) {
+        self.start.virtual_display = None;
+        self.notice(msg.to_owned(), Duration::from_secs(10));
+    }
+
+    pub fn notice(&mut self, msg: String, for_: Duration) {
+        self.status = msg;
+        self.status_until = Some(Instant::now() + for_);
     }
 
     pub fn mic_on(&self) -> bool {
@@ -398,6 +456,10 @@ impl Session {
         if secs < 1.0 {
             return false;
         }
+        if self.status_until.is_some_and(|t| Instant::now() >= t) {
+            self.status_until = None;
+            self.status.clear();
+        }
         if self.stream.is_some() && self.status_log.elapsed() >= Duration::from_secs(5) {
             self.status_log = Instant::now();
             let (f, b, d, r) =
@@ -445,6 +507,9 @@ impl Session {
                 c.fps,
                 if st.cross_gpu { format!("  跨显卡 [{}]→[{}]", st.capture_gpu_index, st.encode_gpu_index) } else { String::new() }
             ));
+            if st.hdr_tonemapped {
+                lines.push("HDR  被控端显示器开启了 HDR，已转换为 SDR 传输".into());
+            }
         }
         let (sfps, skbps, enc_ms, xfer_ms, target, note) = self
             .server_stats
