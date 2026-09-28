@@ -13,6 +13,7 @@ nya-transport = { path = "../common/crates/nya-transport" }
 nya-media = { path = "../common/crates/nya-media" }
 nya-win = { path = "../common/crates/nya-win" }
 nya-ui = { path = "../common/crates/nya-ui" }
+nya-webui = { path = "../common/crates/nya-webui" }
 
 anyhow = "1"
 tracing = "0.1"

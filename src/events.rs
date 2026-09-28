@@ -81,6 +81,12 @@ pub enum UiEvent {
     ClipboardImage(Vec<u8>),
     /// The host wants a pairing code; answer through the sender (None = cancel).
     NeedPairing(std::sync::mpsc::Sender<Option<String>>),
+    /// Hardware decoding summary of this computer (worker thread).
+    DecodeSummary(String),
+    /// A request from the launcher page.
+    Web(nya_webui::Call),
+    /// Late answer to a launcher request (work done on another thread).
+    WebReply(u64, Result<serde_json::Value, String>),
 }
 
 #[derive(Clone)]

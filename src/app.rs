@@ -23,7 +23,10 @@ use crate::events::{ConnectDone, Hotkey, Ui, UiEvent};
 use crate::net::{self, Link, PairPrompt, Params};
 use crate::render::{fit, Renderer};
 use crate::session::{DisplayChoice, Session, SessionOptions};
-use crate::ui::{self, Action, LauncherState, Notice, PairingDialog};
+use crate::ui::{self, Action};
+
+mod launcher;
+use launcher::{Kind, Phase};
 use crate::{caps, input};
 
 /// A connection attempt in progress.
@@ -47,7 +50,11 @@ pub struct App {
     gui: Option<Gui>,
     adapter_luid: u64,
 
-    launcher: LauncherState,
+    /// The launcher page (hidden during a session).
+    web: Option<nya_webui::WebUi>,
+    phase: Phase,
+    /// Hardware decoding of this computer, for the launcher.
+    decode_summary: String,
     session: Option<Session>,
     pending: Option<Pending>,
     attempt: u64,
@@ -157,7 +164,11 @@ impl App {
             renderer: None,
             gui: None,
             adapter_luid: 0,
-            launcher: LauncherState::default(),
+            web: None,
+            phase: Phase::Idle,
+            // Filled in by a worker thread: the check uses multithreaded COM,
+            // which must stay off the UI thread (winit needs OLE there).
+            decode_summary: "正在检测硬件解码…".into(),
             session: None,
             pending: None,
             attempt: 0,
@@ -309,8 +320,7 @@ impl App {
             };
             ui.send(UiEvent::ConnectDone(ConnectDone { attempt, result, pin_mismatch }));
         });
-        self.launcher.connecting = Some(p.label.clone().unwrap_or_else(|| p.address.clone()));
-        self.launcher.notice = None;
+        self.set_phase(Phase::Connecting(Self::pending_label(&p)));
         self.pending = Some(p);
         self.connect_task = Some(task);
         self.request_redraw();
@@ -325,10 +335,7 @@ impl App {
         }
         self.pending = None;
         self.verify_link = None;
-        self.launcher.connecting = None;
-        self.launcher.pairing = None;
-        self.launcher.pin_changed = false;
-        self.launcher.verify_fingerprint = None;
+        self.set_phase(Phase::Idle);
     }
 
     fn on_connect_done(&mut self, done: ConnectDone) {
@@ -336,25 +343,26 @@ impl App {
             return; // cancelled
         }
         self.connect_task = None;
-        self.launcher.connecting = None;
-        self.launcher.pairing = None;
+        let label = self.pending.as_ref().map(Self::pending_label).unwrap_or_default();
         match done.result {
             Ok(link) => {
                 let reverify = self.pending.as_ref().is_some_and(|p| p.reverify);
                 if reverify && !link.welcome.needs_pairing {
-                    self.launcher.verify_fingerprint = Some(link.server_fp.to_string());
+                    self.set_phase(Phase::Verify(label, link.server_fp.to_string()));
                     self.verify_link = Some(link);
                 } else {
+                    self.set_phase(Phase::Idle);
                     self.finish_connect(link);
                 }
             }
             Err(msg) if done.pin_mismatch => {
                 tracing::warn!("{msg}");
-                self.launcher.pin_changed = true;
+                self.set_phase(Phase::PinChanged(label));
             }
             Err(msg) => {
                 self.pending = None;
-                self.launcher.notice = Some(Notice::Error(msg));
+                self.set_phase(Phase::Idle);
+                self.notice(Kind::Error, format!("无法连接 {label}：{msg}"));
             }
         }
     }
@@ -362,10 +370,12 @@ impl App {
     fn finish_connect(&mut self, link: Box<Link>) {
         let Some(p) = self.pending.take() else { return };
         let label = p.label.unwrap_or_else(|| link.welcome.server_name.clone());
-        self.cfg.upsert(HostEntry { name: label.clone(), address: p.address, fingerprint: link.server_fp.to_hex() });
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        self.cfg.upsert(HostEntry { name: label.clone(), address: p.address, fingerprint: link.server_fp.to_hex(), last_connected: now });
         if let Err(e) = self.cfg.save(&self.data_dir) {
             tracing::warn!("save config: {e:#}");
         }
+        self.push_state();
         let Some(dev) = self.renderer.as_ref().map(|r| r.dev.clone()) else { return };
         let d = self.cfg.defaults.clone();
         let monitor_fps = self
@@ -395,7 +405,7 @@ impl App {
         self.session = Some(session);
         self.vd_resize_at = None;
         self.toolbar_open = false;
-        self.launcher.notice = None;
+        self.show_web(false);
         if d.fullscreen {
             self.set_fullscreen(true);
         }
@@ -403,7 +413,7 @@ impl App {
         self.update_title();
     }
 
-    fn end_session(&mut self, message: Option<Notice>) {
+    fn end_session(&mut self, message: Option<(Kind, String)>) {
         let Some(s) = self.session.take() else { return };
         s.quit();
         drop(s);
@@ -414,7 +424,10 @@ impl App {
             w.set_cursor_visible(true);
         }
         self.remote_buttons = 0;
-        self.launcher.notice = message;
+        self.show_web(true);
+        if let Some((kind, text)) = message {
+            self.notice(kind, text);
+        }
         self.update_no_hotkeys();
         self.update_title();
         self.request_redraw();
@@ -503,7 +516,7 @@ impl App {
                     s.select_display_index(n);
                 }
             }
-            Hotkey::Quit => self.end_session(Some(Notice::Info("已断开连接".into()))),
+            Hotkey::Quit => self.end_session(Some((Kind::Info, "已断开连接".into()))),
         }
         self.update_title();
         self.request_redraw();
@@ -523,54 +536,6 @@ impl App {
     fn apply(&mut self, actions: Vec<Action>) {
         for a in actions {
             match a {
-                Action::Connect { target, name } => self.connect(target, name),
-                Action::CancelConnect => self.cancel_connect(),
-                Action::PairCode(code) => {
-                    self.launcher.pairing = None;
-                    if let Some(tx) = self.pair_reply.take() {
-                        let _ = tx.send(code);
-                    }
-                }
-                Action::PinChanged(yes) => {
-                    self.launcher.pin_changed = false;
-                    match self.pending.take() {
-                        Some(mut p) if yes => {
-                            p.reverify = true;
-                            self.start_connect(p);
-                        }
-                        _ => self.pending = None,
-                    }
-                }
-                Action::FingerprintOk(yes) => {
-                    self.launcher.verify_fingerprint = None;
-                    match self.verify_link.take() {
-                        Some(link) if yes => self.finish_connect(link),
-                        _ => {
-                            self.pending = None;
-                            self.launcher.notice = Some(Notice::Error("证书指纹未确认，已取消连接".into()));
-                        }
-                    }
-                }
-                Action::DeleteHost(i) => {
-                    if i < self.cfg.hosts.len() {
-                        self.cfg.hosts.remove(i);
-                        let _ = self.cfg.save(&self.data_dir);
-                    }
-                }
-                Action::RenameHost(i, name) => match self.cfg.rename(i, &name) {
-                    Ok(()) => {
-                        self.launcher.rename = None;
-                        if let Err(e) = self.cfg.save(&self.data_dir) {
-                            self.launcher.notice = Some(Notice::Error(format!("保存失败：{e:#}")));
-                        }
-                    }
-                    Err(e) => self.launcher.rename_error = Some(e.into()),
-                },
-                Action::SaveConfig => {
-                    if let Err(e) = self.cfg.save(&self.data_dir) {
-                        self.launcher.notice = Some(Notice::Error(format!("保存失败：{e:#}")));
-                    }
-                }
                 Action::Hotkey(h) => self.hotkey(h),
                 Action::SetGameMode(g) => {
                     if let Some(s) = &mut self.session {
@@ -653,7 +618,7 @@ impl App {
                         s.set_bitrate_policy(p);
                     }
                 }
-                Action::Disconnect => self.end_session(Some(Notice::Info("已断开连接".into()))),
+                Action::Disconnect => self.end_session(Some((Kind::Info, "已断开连接".into()))),
                 Action::PickFiles => {
                     if let Some(paths) = rfd::FileDialog::new().set_title("选择要发送到被控端的文件").pick_files() {
                         if let Some(s) = &mut self.session {
@@ -687,13 +652,17 @@ impl App {
 
     fn draw(&mut self) {
         let Some(window) = self.window.clone() else { return };
+        if self.session.is_none() {
+            return; // the launcher page covers the window
+        }
         let Some(mut gui) = self.gui.take() else { return };
         let mut actions = Vec::new();
         let (toolbar_open, fullscreen, hovering_file) = (self.toolbar_open, self.fullscreen, self.hovering_file);
-        let (session, launcher, cfg) = (&mut self.session, &mut self.launcher, &mut self.cfg);
-        let frame = gui.run(&window, |ctx| match session.as_mut() {
-            Some(s) => ui::session_overlay(ctx, s, toolbar_open, fullscreen, hovering_file, &mut actions),
-            None => ui::launcher(ctx, launcher, cfg, &mut actions),
+        let session = &mut self.session;
+        let frame = gui.run(&window, |ctx| {
+            if let Some(s) = session.as_mut() {
+                ui::session_overlay(ctx, s, toolbar_open, fullscreen, hovering_file, &mut actions)
+            }
         });
 
         let mut fresh = false;
@@ -932,7 +901,10 @@ impl ApplicationHandler<UiEvent> for App {
         if self.window.is_some() {
             return;
         }
-        let attrs = Window::default_attributes().with_title("NyaRemoteControl").with_inner_size(LogicalSize::new(1100.0, 760.0));
+        let attrs = Window::default_attributes()
+            .with_title("NyaRemoteControl")
+            .with_inner_size(LogicalSize::new(1100.0, 760.0))
+            .with_min_inner_size(LogicalSize::new(640.0, 480.0));
         let window = match el.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {
@@ -959,6 +931,9 @@ impl ApplicationHandler<UiEvent> for App {
         if let Some(h) = hwnd(&window) {
             input::install(h, self.ui_tx.clone());
         }
+        self.create_web();
+        let ui = self.ui_tx.clone();
+        std::thread::spawn(move || ui.send(UiEvent::DecodeSummary(crate::diag::decode_summary())));
         if let Some((target, name)) = self.auto_connect.take() {
             self.connect(target, name);
         }
@@ -986,6 +961,9 @@ impl ApplicationHandler<UiEvent> for App {
                 el.exit();
             }
             WindowEvent::Resized(size) => {
+                if let Some(w) = &self.web {
+                    w.resize(*size);
+                }
                 if let Some(r) = self.renderer.as_mut() {
                     if let Err(e) = r.resize(size.width, size.height) {
                         tracing::warn!("resize: {e:#}");
@@ -1064,12 +1042,23 @@ impl ApplicationHandler<UiEvent> for App {
             UiEvent::Frame => return self.draw(),
             UiEvent::Cursor(m) => return self.on_cursor(el, m),
             UiEvent::ConnectDone(d) => self.on_connect_done(d),
+            UiEvent::Web(c) => self.on_web_call(c),
+            UiEvent::DecodeSummary(s) => {
+                self.decode_summary = s;
+                self.push_state();
+            }
+            UiEvent::WebReply(id, r) => {
+                if let Some(w) = &self.web {
+                    w.reply(id, r);
+                }
+            }
             UiEvent::NeedPairing(tx) => {
                 self.pair_reply = Some(tx);
-                self.launcher.pairing = Some(PairingDialog { code: String::new() });
+                let label = self.pending.as_ref().map(Self::pending_label).unwrap_or_default();
+                self.set_phase(Phase::Pairing(label));
             }
             UiEvent::Hotkey(h) => self.hotkey(h),
-            UiEvent::Disconnected(msg) => self.end_session(Some(Notice::Error(msg))),
+            UiEvent::Disconnected(msg) => self.end_session(Some((Kind::Error, msg))),
             UiEvent::FileOffer(o) => {
                 if let Some(s) = &mut self.session {
                     s.on_offer(o);

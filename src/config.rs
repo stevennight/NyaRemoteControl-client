@@ -15,6 +15,9 @@ pub struct HostEntry {
     /// Pinned server certificate fingerprint (hex).
     #[serde(default)]
     pub fingerprint: String,
+    /// Unix seconds of the last successful connection (0 = never).
+    #[serde(default)]
+    pub last_connected: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +140,7 @@ impl ClientConfig {
             let name_free = !entry.name.trim().is_empty() && !self.hosts.iter().any(|o| o.name == entry.name.trim());
             let h = &mut self.hosts[i];
             h.fingerprint = entry.fingerprint;
+            h.last_connected = entry.last_connected.max(h.last_connected);
             if name_free {
                 h.name = entry.name.trim().to_owned();
             }
@@ -158,7 +162,7 @@ mod tests {
     use super::*;
 
     fn host(name: &str, address: &str) -> HostEntry {
-        HostEntry { name: name.into(), address: address.into(), fingerprint: String::new() }
+        HostEntry { name: name.into(), address: address.into(), fingerprint: String::new(), last_connected: 0 }
     }
 
     #[test]
