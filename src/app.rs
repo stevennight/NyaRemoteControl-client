@@ -129,6 +129,7 @@ fn start_request(d: &Defaults, setup: Option<pb::DisplaySetup>) -> pb::StartStre
         // The first virtual screen is the host's primary display.
         display_id: if setup.as_ref().is_some_and(|s| !s.virtual_screens.is_empty()) { 0 } else { d.display },
         display_setup: setup,
+        slot: 0,
         config: Some(pb::StreamConfig {
             codec: parse_codec(&d.codec) as i32,
             chroma: parse_chroma(&d.chroma) as i32,
@@ -827,7 +828,7 @@ impl App {
                 if !over_ui && !relative && self.focused {
                     if let Some((x, y)) = self.map_mouse(position.x, position.y) {
                         if let Some(s) = &self.session {
-                            s.send_input(Ev::MouseAbs(pb::MouseAbs { x, y }));
+                            s.send_input(Ev::MouseAbs(pb::MouseAbs { x, y, slot: 0 }));
                         }
                     }
                 }

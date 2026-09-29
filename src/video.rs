@@ -209,7 +209,7 @@ impl VideoThread {
     fn request_keyframe(&self, last: &mut Instant) {
         if last.elapsed() > Duration::from_millis(250) {
             *last = Instant::now();
-            let _ = self.net.send(NetCmd::Control(pb::ControlMsg { msg: Some(Msg::RequestKeyframe(pb::RequestKeyframe {})) }));
+            let _ = self.net.send(NetCmd::Control(pb::ControlMsg { msg: Some(Msg::RequestKeyframe(pb::RequestKeyframe { slot: 0 })) }));
         }
     }
 

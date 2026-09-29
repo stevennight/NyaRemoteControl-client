@@ -210,6 +210,7 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
         sinks.stats.clone(),
         sinks.clip.clone(),
         (files_on, images_on, clip_on),
+        neg.has(Feature::MultiStream),
     ));
     // Control messages from spawned tasks (failed clipboard sends).
     let (internal_tx, mut internal_rx) = mpsc::unbounded_channel::<pb::ControlMsg>();
@@ -384,6 +385,7 @@ async fn accept_uni(
     stats: Arc<Shared>,
     clip: Arc<crate::transfer::ClipFiles>,
     flags: (bool, bool, bool),
+    multi: bool,
 ) {
     let downloads = Arc::new(crate::transfer::Downloads::default());
     while let Ok(mut r) = conn.accept_uni().await {
@@ -393,6 +395,18 @@ async fn accept_uni(
                 Ok(Some(stream_type::FILE)) => crate::transfer::receive(r, ui, downloads, clip, flags).await,
                 Ok(Some(stream_type::VIDEO)) => {
                     let Ok(Some(stream_id)) = read_varint(&mut r).await else { return };
+                    // With FEATURE_MULTI_STREAM the prelude names the window (slot).
+                    let slot = if multi {
+                        let Ok(Some(slot)) = read_varint(&mut r).await else { return };
+                        slot as u32
+                    } else {
+                        0
+                    };
+                    if slot != 0 {
+                        tracing::debug!("ignoring video stream {stream_id} for slot {slot}");
+                        let _ = r.stop(0u32.into());
+                        return;
+                    }
                     tracing::info!("video stream {stream_id} opened by host");
                     loop {
                         let mut len = [0u8; 4];
