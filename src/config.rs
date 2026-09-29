@@ -58,6 +58,8 @@ pub struct Defaults {
     pub vd_height: u32,
     /// Give the virtual display this computer's display scaling.
     pub vd_scale: bool,
+    /// Open every host display in its own window (otherwise one window, switch between them).
+    pub multi_window: bool,
 }
 
 impl Default for Defaults {
@@ -83,6 +85,7 @@ impl Default for Defaults {
             vd_width: 1920,
             vd_height: 1080,
             vd_scale: true,
+            multi_window: false,
         }
     }
 }

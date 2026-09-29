@@ -13,6 +13,8 @@ pub enum Action {
     Hotkey(Hotkey),
     SetGameMode(bool),
     SelectDisplay(u32),
+    /// Show this host display in an extra window.
+    OpenWindow(u32),
     SetDisplayChoice(crate::session::DisplayChoice),
     SetGrab(bool),
     SetPolicy(nya_proto::pb::BitratePolicy),
@@ -124,10 +126,20 @@ fn displays_menu(ui: &mut egui::Ui, s: &Session, actions: &mut Vec<Action>) {
                 d.height,
                 if d.hdr { " · HDR→SDR" } else { "" }
             );
-            if ui.selectable_label(d.id == current, text).clicked() && d.id != current {
-                actions.push(Action::SelectDisplay(d.id));
-                ui.close_menu();
-            }
+            ui.horizontal(|ui| {
+                if ui.selectable_label(d.id == current, text).clicked() && d.id != current {
+                    actions.push(Action::SelectDisplay(d.id));
+                    ui.close_menu();
+                }
+                if s.multi_supported && d.id != current {
+                    let open = s.view_of(d.id).is_some();
+                    let label = if open { "窗口中" } else { "新窗口" };
+                    if ui.small_button(label).on_hover_text(if open { "已在单独的窗口中显示，点击切换过去" } else { "在一个新窗口里同时显示这个屏幕" }).clicked() {
+                        actions.push(Action::OpenWindow(d.id));
+                        ui.close_menu();
+                    }
+                }
+            });
         }
     }
     ui.separator();
@@ -163,6 +175,65 @@ fn displays_menu(ui: &mut egui::Ui, s: &Session, actions: &mut Vec<Action>) {
             .color(DIM),
         );
     }
+}
+
+/// What the small toolbar of an extra window asks for.
+pub enum ExtraAction {
+    None,
+    ToggleFullscreen,
+    Close,
+}
+
+/// Toolbar of an extra window (another host display): name, fullscreen, close.
+/// Same behaviour as the main bar: a thin tab until the pointer reaches the top.
+pub fn extra_overlay(ctx: &egui::Context, title: &str, status: &str, fullscreen: bool) -> ExtraAction {
+    let mut action = ExtraAction::None;
+    let pointer = ctx.input(|i| i.pointer.hover_pos());
+    let near_top = pointer.is_some_and(|p| p.y < 48.0);
+    let show = near_top || ctx.memory(|m| m.any_popup_open());
+    egui::Area::new(egui::Id::new("extra-toolbar"))
+        .anchor(Align2::CENTER_TOP, [0.0, if show { 8.0 } else { 0.0 }])
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            let frame = egui::Frame::NONE.fill(Color32::from_rgba_unmultiplied(28, 30, 36, 235)).stroke(egui::Stroke::new(1.0_f32, Color32::from_white_alpha(18)));
+            if !show {
+                frame
+                    .corner_radius(egui::CornerRadius { nw: 0, ne: 0, sw: 8, se: 8 })
+                    .inner_margin(egui::Margin::symmetric(12, 2))
+                    .show(ui, |ui| ui.label(RichText::new(format!("▾ {title}")).small().color(DIM)));
+                return;
+            }
+            frame.corner_radius(12).inner_margin(egui::Margin::same(4)).show(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(title).strong().color(Color32::WHITE));
+                    bar_separator(ui);
+                    let mut fs = fullscreen;
+                    if ui.toggle_value(&mut fs, "全屏").changed() {
+                        action = ExtraAction::ToggleFullscreen;
+                    }
+                    if ui.button("关闭窗口").on_hover_text("只关闭这个窗口，不断开连接").clicked() {
+                        action = ExtraAction::Close;
+                    }
+                });
+            });
+        });
+    if !status.is_empty() {
+        egui::Area::new(egui::Id::new("extra-status"))
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::NONE.fill(Color32::from_rgba_unmultiplied(28, 30, 36, 235)).corner_radius(10).inner_margin(egui::Margin::symmetric(14, 8)).show(ui, |ui| {
+                    ui.label(RichText::new(status).color(Color32::WHITE));
+                });
+            });
+    }
+    if pointer.is_some_and(|p| p.y < 60.0) {
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+    action
 }
 
 /// Less frequent session controls.

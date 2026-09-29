@@ -64,12 +64,13 @@ pub enum UiEvent {
     SessionInfo(pb::SessionInfo),
     GamepadRumble(pb::GamepadRumble),
     StreamStarted(pb::StreamStarted),
-    StreamError(String),
+    /// (slot, message)
+    StreamError(u32, String),
     Cursor(pb::CursorMsg),
     ServerStats(pb::ServerStats),
     Clipboard(String),
-    /// A new decoded frame is ready in the frame store.
-    Frame,
+    /// A new decoded frame is ready in the frame store of this slot.
+    Frame(u32),
     Reconnecting(String),
     Disconnected(String),
     Hotkey(Hotkey),

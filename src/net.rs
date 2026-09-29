@@ -98,6 +98,35 @@ pub async fn connect(
 }
 
 /// Everything needed to (re)start the session.
+/// Decoder input of every open window, by stream slot.
+#[derive(Default)]
+pub struct VideoRoutes(std::sync::Mutex<std::collections::HashMap<u32, Sender<VideoIn>>>);
+
+impl VideoRoutes {
+    pub fn set(&self, slot: u32, tx: Option<Sender<VideoIn>>) {
+        let mut m = self.0.lock().unwrap();
+        match tx {
+            Some(tx) => {
+                m.insert(slot, tx);
+            }
+            None => {
+                m.remove(&slot);
+            }
+        }
+    }
+
+    fn get(&self, slot: u32) -> Option<Sender<VideoIn>> {
+        self.0.lock().unwrap().get(&slot).cloned()
+    }
+
+    /// Reconnect: every decoder waits for a new keyframe.
+    fn reset_all(&self) {
+        for tx in self.0.lock().unwrap().values() {
+            let _ = tx.send(VideoIn::Reset);
+        }
+    }
+}
+
 pub struct Params {
     pub addr: SocketAddr,
     pub pinned: Fingerprint,
@@ -105,11 +134,13 @@ pub struct Params {
     pub name: String,
     pub caps: pb::ClientCaps,
     pub start: pb::StartStream,
+    /// Streams of extra windows (slot > 0), replayed after a reconnect.
+    pub extra: std::collections::BTreeMap<u32, pb::StartStream>,
 }
 
 pub struct Sinks {
     pub ui: Ui,
-    pub video: Sender<VideoIn>,
+    pub video: Arc<VideoRoutes>,
     pub audio: Sender<AudioPacket>,
     pub stats: Arc<Shared>,
     pub clip: Arc<crate::transfer::ClipFiles>,
@@ -155,7 +186,7 @@ pub async fn supervise(first: Link, mut p: Params, mut cmds: mpsc::UnboundedRece
             },
         };
         lost_since = None;
-        let _ = sinks.video.send(VideoIn::Reset);
+        sinks.video.reset_all();
         match run(l, &mut p, &mut cmds, &sinks).await {
             End::UserQuit => return,
             End::Fatal(msg) => {
@@ -173,8 +204,19 @@ pub async fn supervise(first: Link, mut p: Params, mut cmds: mpsc::UnboundedRece
 /// Keep the replayable state current.
 fn track(p: &mut Params, m: &pb::ControlMsg) {
     match &m.msg {
+        Some(Msg::StartStream(s)) if s.slot != 0 => {
+            p.extra.insert(s.slot, s.clone());
+        }
+        Some(Msg::StopStream(s)) if s.slot != 0 => {
+            p.extra.remove(&s.slot);
+        }
         Some(Msg::StartStream(s)) => p.start = s.clone(),
-        Some(Msg::SetMode(m)) => p.start.config.get_or_insert_with(Default::default).mode = m.mode,
+        Some(Msg::SetMode(m)) => {
+            p.start.config.get_or_insert_with(Default::default).mode = m.mode;
+            for s in p.extra.values_mut() {
+                s.config.get_or_insert_with(Default::default).mode = m.mode;
+            }
+        }
         Some(Msg::ClientCaps(c)) => p.caps = c.clone(),
         _ => {}
     }
@@ -187,6 +229,9 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
     let setup = async {
         write_msg(&mut send, &ctl(Msg::ClientCaps(p.caps.clone()))).await?;
         write_msg(&mut send, &ctl(Msg::StartStream(p.start.clone()))).await?;
+        for s in p.extra.values() {
+            write_msg(&mut send, &ctl(Msg::StartStream(s.clone()))).await?;
+        }
         let mut input = conn.open_uni().await?;
         input.set_priority(20)?;
         let mut prelude = Vec::new();
@@ -250,7 +295,7 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
                     Some(Msg::SessionInfo(i)) => sinks.ui.send(UiEvent::SessionInfo(i)),
                     // The decoder notices the new stream id itself; frames may arrive first.
                     Some(Msg::StreamStarted(s)) => sinks.ui.send(UiEvent::StreamStarted(s)),
-                    Some(Msg::StreamError(e)) => sinks.ui.send(UiEvent::StreamError(e.message)),
+                    Some(Msg::StreamError(e)) => sinks.ui.send(UiEvent::StreamError(e.slot, e.message)),
                     Some(Msg::DisplayChanged(d)) => tracing::info!("host displays changed: {} displays", d.displays.len()),
                     Some(Msg::ServerStats(s)) => sinks.ui.send(UiEvent::ServerStats(s)),
                     Some(Msg::ClipboardText(c)) if clipboard => sinks.ui.send(UiEvent::Clipboard(c.text)),
@@ -380,7 +425,7 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
 
 async fn accept_uni(
     conn: Connection,
-    video: Sender<VideoIn>,
+    video: Arc<VideoRoutes>,
     ui: Ui,
     stats: Arc<Shared>,
     clip: Arc<crate::transfer::ClipFiles>,
@@ -402,12 +447,12 @@ async fn accept_uni(
                     } else {
                         0
                     };
-                    if slot != 0 {
-                        tracing::debug!("ignoring video stream {stream_id} for slot {slot}");
+                    let Some(video) = video.get(slot) else {
+                        tracing::debug!("ignoring video stream {stream_id}: no window for slot {slot}");
                         let _ = r.stop(0u32.into());
                         return;
-                    }
-                    tracing::info!("video stream {stream_id} opened by host");
+                    };
+                    tracing::info!("video stream {stream_id} (slot {slot}) opened by host");
                     loop {
                         let mut len = [0u8; 4];
                         if r.read_exact(&mut len).await.is_err() {

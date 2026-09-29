@@ -190,6 +190,8 @@ fn codec_of(h: &VideoFrameHeader) -> Option<VideoCodec> {
 }
 
 pub struct VideoThread {
+    /// Client window (stream slot) this decoder feeds.
+    pub slot: u32,
     pub hw_allowed: bool,
     pub caps: pb::ClientCaps,
     pub store: Arc<FrameStore>,
@@ -201,7 +203,7 @@ pub struct VideoThread {
 impl VideoThread {
     pub fn spawn(self, dev: D3dDevice, rx: Receiver<VideoIn>) {
         std::thread::Builder::new()
-            .name("nya-decode".into())
+            .name(format!("nya-decode-{}", self.slot))
             .spawn(move || self.run(dev, rx))
             .expect("spawn decode thread");
     }
@@ -209,7 +211,7 @@ impl VideoThread {
     fn request_keyframe(&self, last: &mut Instant) {
         if last.elapsed() > Duration::from_millis(250) {
             *last = Instant::now();
-            let _ = self.net.send(NetCmd::Control(pb::ControlMsg { msg: Some(Msg::RequestKeyframe(pb::RequestKeyframe { slot: 0 })) }));
+            let _ = self.net.send(NetCmd::Control(pb::ControlMsg { msg: Some(Msg::RequestKeyframe(pb::RequestKeyframe { slot: self.slot })) }));
         }
     }
 
@@ -382,7 +384,7 @@ impl VideoThread {
                                 s.frames_dropped += 1;
                             }
                         });
-                        self.ui.send(UiEvent::Frame);
+                        self.ui.send(UiEvent::Frame(self.slot));
                     }
                 }
             }

@@ -25,6 +25,7 @@ use crate::render::{fit, Renderer};
 use crate::session::{DisplayChoice, Session, SessionOptions};
 use crate::ui::{self, Action};
 
+mod extra;
 mod launcher;
 use launcher::{Kind, Phase};
 use crate::{caps, input};
@@ -76,6 +77,13 @@ pub struct App {
     dropped: Vec<PathBuf>,
     /// Window resized: resize the host's virtual display at this time.
     vd_resize_at: Option<Instant>,
+    /// Extra windows (other host displays at the same time).
+    extras: std::collections::HashMap<WindowId, extra::ExtraWindow>,
+    /// Displays to open in a new window (needs the event loop: about_to_wait).
+    open_requests: Vec<u32>,
+    auto_opened: extra::AutoOpened,
+    /// Host displays or the main stream changed: check the extra windows.
+    sync_extras: bool,
 }
 
 fn hwnd(window: &Window) -> Option<windows::Win32::Foundation::HWND> {
@@ -187,6 +195,10 @@ impl App {
             hovering_file: false,
             dropped: Vec::new(),
             vd_resize_at: None,
+            extras: Default::default(),
+            open_requests: Vec::new(),
+            auto_opened: Default::default(),
+            sync_extras: false,
         }
     }
 
@@ -223,6 +235,7 @@ impl App {
                 if let Err(e) = self.create_renderer(dev) {
                     tracing::error!("renderer: {e:#}");
                 }
+                self.rebuild_extras();
             }
             Err(e) => tracing::error!("D3D device: {e:#}"),
         }
@@ -398,6 +411,7 @@ impl App {
             name: self.client_name.clone(),
             caps,
             start: start_request(&d, vd),
+            extra: Default::default(),
         };
         let opts = SessionOptions { hw_decode: d.hw_decode, audio: d.audio, clipboard: d.clipboard };
         let mut session = Session::start(&self.rt, *link, params, &dev, &opts, self.ui_tx.clone(), label);
@@ -415,6 +429,7 @@ impl App {
     }
 
     fn end_session(&mut self, message: Option<(Kind, String)>) {
+        self.close_all_extras();
         let Some(s) = self.session.take() else { return };
         s.quit();
         drop(s);
@@ -543,6 +558,7 @@ impl App {
                         s.set_game_mode(g);
                     }
                 }
+                Action::OpenWindow(display_id) => self.open_requests.push(display_id),
                 Action::SetDisplayChoice(choice) => {
                     let setup = self.setup_request(choice, self.fullscreen);
                     if let Some(s) = &mut self.session {
@@ -773,6 +789,20 @@ impl App {
                     Err(e) => tracing::debug!("cursor shape: {e}"),
                 }
             }
+            Some(cursor_msg::Msg::State(st)) if st.slot != 0 => {
+                // Cursor of a display shown in an extra window.
+                // (Fields, not methods: `s` borrows the session.)
+                let Some(w) = self.extras.values().find(|w| w.slot == st.slot).map(|w| w.window.clone()) else { return };
+                if let Some(c) = s.cursors.get(&st.shape_id) {
+                    w.set_cursor(c.clone());
+                }
+                if let Some(v) = s.views.get_mut(&st.slot) {
+                    if v.cursor_visible != st.visible {
+                        v.cursor_visible = st.visible;
+                        w.set_cursor_visible(st.visible);
+                    }
+                }
+            }
             Some(cursor_msg::Msg::State(st)) => {
                 let Some(w) = &self.window else { return };
                 if st.shape_id != s.cursor_shape {
@@ -941,8 +971,11 @@ impl ApplicationHandler<UiEvent> for App {
         self.draw();
     }
 
-    fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, el: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         let Some(window) = self.window.clone() else { return };
+        if id != window.id() {
+            return self.extra_event(id, event);
+        }
         // Keyboard goes to egui only in the launcher (in a session it belongs to the host).
         let keyboard = matches!(event, WindowEvent::KeyboardInput { .. } | WindowEvent::ModifiersChanged(_) | WindowEvent::Ime(_));
         if self.session.is_none() || !keyboard {
@@ -1040,7 +1073,13 @@ impl ApplicationHandler<UiEvent> for App {
 
     fn user_event(&mut self, el: &ActiveEventLoop, event: UiEvent) {
         match event {
-            UiEvent::Frame => return self.draw(),
+            UiEvent::Frame(0) => return self.draw(),
+            UiEvent::Frame(slot) => {
+                if let Some(id) = self.extra_of_slot(slot) {
+                    self.draw_extra(id);
+                }
+                return;
+            }
             UiEvent::Cursor(m) => return self.on_cursor(el, m),
             UiEvent::ConnectDone(d) => self.on_connect_done(d),
             UiEvent::Web(c) => self.on_web_call(c),
@@ -1108,13 +1147,27 @@ impl ApplicationHandler<UiEvent> for App {
                 let Some(s) = self.session.as_mut() else { return };
                 match other {
                     UiEvent::Connected => s.status.clear(),
-                    UiEvent::SessionInfo(i) => s.on_session_info(i, self.focused),
+                    UiEvent::SessionInfo(i) => {
+                        s.on_session_info(i, self.focused);
+                        self.sync_extras = true;
+                    }
                     UiEvent::GamepadRumble(r) => {
                         if let Some(g) = &s.gamepads {
                             g.rumble(&r);
                         }
                     }
+                    UiEvent::StreamStarted(st) if st.slot != 0 => {
+                        let slot = st.slot;
+                        if let Some(v) = s.views.get_mut(&slot) {
+                            v.status.clear();
+                            v.stream = Some(st);
+                        }
+                        if let Some(id) = self.extra_of_slot(slot) {
+                            self.extras[&id].window.request_redraw();
+                        }
+                    }
                     UiEvent::StreamStarted(st) => {
+                        self.sync_extras = true;
                         tracing::info!(
                             "stream: {} {:?} cross_gpu={}",
                             st.encoder_name,
@@ -1128,11 +1181,19 @@ impl ApplicationHandler<UiEvent> for App {
                         }
                         s.cursor_shape = 0;
                     }
-                    UiEvent::StreamError(e) if e.starts_with("虚拟显示器") => {
+                    UiEvent::StreamError(slot, e) if slot != 0 => {
+                        if let Some(v) = s.views.get_mut(&slot) {
+                            v.status = e;
+                        }
+                        if let Some(id) = self.extra_of_slot(slot) {
+                            self.extras[&id].window.request_redraw();
+                        }
+                    }
+                    UiEvent::StreamError(_, e) if e.starts_with("虚拟显示器") => {
                         tracing::error!("{e}");
                         s.virtual_display_failed(&e);
                     }
-                    UiEvent::StreamError(e) => {
+                    UiEvent::StreamError(_, e) => {
                         tracing::error!("stream error: {e}");
                         s.status = format!("被控端无法开始推流：{e}");
                     }
@@ -1154,6 +1215,12 @@ impl ApplicationHandler<UiEvent> for App {
         if self.exit {
             el.exit();
             return;
+        }
+        if std::mem::take(&mut self.sync_extras) {
+            self.sync_extras();
+        }
+        for display_id in std::mem::take(&mut self.open_requests) {
+            self.open_extra(el, display_id);
         }
         let mut redraw = false;
         // One drop delivers one DroppedFile event per file; send them as a batch.

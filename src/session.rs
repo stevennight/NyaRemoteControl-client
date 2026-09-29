@@ -14,7 +14,7 @@ use winit::window::CustomCursor;
 
 use crate::clipboard::ClipIn;
 use crate::events::{NetCmd, TransferUpdate, Ui};
-use crate::net::{self, Link, Params, Sinks};
+use crate::net::{self, Link, Params, Sinks, VideoRoutes};
 use crate::stats::{Shared, Summary};
 use crate::video::{FrameStore, Slot, VideoIn, VideoThread};
 use crate::input;
@@ -46,6 +46,18 @@ pub struct DisplayChoice {
     pub block_input: bool,
 }
 
+/// An extra window's stream: another host display shown at the same time
+/// (FEATURE_MULTI_STREAM). The window itself belongs to the app.
+pub struct View {
+    pub display_id: u32,
+    video_tx: Sender<VideoIn>,
+    pub store: Arc<FrameStore>,
+    pub stream: Option<pb::StreamStarted>,
+    pub current: Option<Arc<Slot>>,
+    pub cursor_visible: bool,
+    pub status: String,
+}
+
 pub struct SessionOptions {
     pub hw_decode: bool,
     pub audio: bool,
@@ -56,6 +68,17 @@ pub struct Session {
     pub label: String,
     pub net_tx: UnboundedSender<NetCmd>,
     video_tx: Sender<VideoIn>,
+    /// Decoder inputs by slot, shared with the network task.
+    routes: Arc<VideoRoutes>,
+    /// Extra windows by slot (> 0).
+    pub views: std::collections::BTreeMap<u32, View>,
+    next_slot: u32,
+    /// The host can stream several displays at once.
+    pub multi_supported: bool,
+    dev: D3dDevice,
+    hw_decode: bool,
+    caps: pb::ClientCaps,
+    ui: Ui,
     pub stats: Arc<Shared>,
     pub store: Arc<FrameStore>,
     clip_tx: Option<Sender<ClipIn>>,
@@ -119,6 +142,7 @@ impl Session {
         let game = params.start.config.as_ref().is_some_and(|c| c.mode == pb::StreamMode::Game as i32);
 
         VideoThread {
+            slot: 0,
             hw_allowed: opts.hw_decode,
             caps: params.caps.clone(),
             store: store.clone(),
@@ -139,13 +163,25 @@ impl Session {
         input::set_session(Some(net_tx.clone()));
 
         let start = params.start.clone();
-        let sinks = Sinks { ui, video: video_tx.clone(), audio: audio_tx, stats: stats.clone(), clip: Default::default() };
+        let multi_supported = link.neg.has(nya_proto::pb::Feature::MultiStream);
+        let caps = params.caps.clone();
+        let routes = Arc::new(VideoRoutes::default());
+        routes.set(0, Some(video_tx.clone()));
+        let sinks = Sinks { ui: ui.clone(), video: routes.clone(), audio: audio_tx, stats: stats.clone(), clip: Default::default() };
         rt.spawn(net::supervise(link, params, net_rx, sinks));
 
         Self {
             label,
             net_tx,
             video_tx,
+            routes,
+            views: Default::default(),
+            next_slot: 1,
+            multi_supported,
+            dev: dev.clone(),
+            hw_decode: opts.hw_decode,
+            caps,
+            ui,
             stats,
             store,
             clip_tx,
@@ -190,8 +226,60 @@ impl Session {
         self.send_input(Ev::ReleaseAll(pb::ReleaseAll {}));
     }
 
-    pub fn set_device(&self, dev: &D3dDevice) {
+    pub fn set_device(&mut self, dev: &D3dDevice) {
+        self.dev = dev.clone();
         let _ = self.video_tx.send(VideoIn::Device(dev.clone()));
+        for v in self.views.values() {
+            let _ = v.video_tx.send(VideoIn::Device(dev.clone()));
+        }
+    }
+
+    /// Show host display `display_id` in an extra window: start its stream.
+    /// Returns the new slot.
+    pub fn open_view(&mut self, display_id: u32) -> u32 {
+        let slot = self.next_slot;
+        self.next_slot += 1;
+        let (video_tx, video_rx) = crossbeam_channel::bounded(16);
+        let store = Arc::new(FrameStore::default());
+        VideoThread {
+            slot,
+            hw_allowed: self.hw_decode,
+            caps: self.caps.clone(),
+            store: store.clone(),
+            ui: self.ui.clone(),
+            net: self.net_tx.clone(),
+            stats: Arc::new(Shared::new()),
+        }
+        .spawn(self.dev.clone(), video_rx);
+        self.routes.set(slot, Some(video_tx.clone()));
+        // Same picture settings as the main window; the display setup is its business.
+        let req = pb::StartStream { display_id, slot, display_setup: None, ..self.start.clone() };
+        let _ = self.net_tx.send(ctl(Msg::StartStream(req)));
+        self.views.insert(slot, View { display_id, video_tx, store, stream: None, current: None, cursor_visible: true, status: "连接中".into() });
+        tracing::info!("extra window: display {display_id} in slot {slot}");
+        slot
+    }
+
+    /// The extra window of `slot` was closed: stop its stream.
+    pub fn close_view(&mut self, slot: u32) {
+        if self.views.remove(&slot).is_some() {
+            self.routes.set(slot, None);
+            let _ = self.net_tx.send(ctl(Msg::StopStream(pb::StopStream { slot })));
+        }
+    }
+
+    /// Slot of the extra window showing `display_id`, if any.
+    pub fn view_of(&self, display_id: u32) -> Option<u32> {
+        self.views.iter().find(|(_, v)| v.display_id == display_id).map(|(s, _)| *s)
+    }
+
+    /// Display name for window titles and menus ("屏幕 2 · 虚拟").
+    pub fn display_title(&self, display_id: u32) -> String {
+        let Some(info) = &self.info else { return "显示器".into() };
+        match info.displays.iter().position(|d| d.id == display_id) {
+            Some(i) => format!("屏幕 {}{}", i + 1, if info.displays[i].is_virtual { " · 虚拟" } else { "" }),
+            None => "显示器".into(),
+        }
     }
 
     pub fn set_game_mode(&mut self, game: bool) {

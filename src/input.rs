@@ -26,6 +26,8 @@ use crate::events::{Hotkey, NetCmd, Ui, UiEvent};
 
 struct HookState {
     hwnd: AtomicIsize,
+    /// Extra session windows (other host displays); keys go to the host from those too.
+    extra: Mutex<Vec<isize>>,
     grab: AtomicBool,
     mods: AtomicU8,
     tx: Mutex<Option<UnboundedSender<NetCmd>>>,
@@ -75,6 +77,7 @@ const SHIFT: u8 = 4;
 fn state() -> &'static HookState {
     STATE.get_or_init(|| HookState {
         hwnd: AtomicIsize::new(0),
+        extra: Mutex::new(Vec::new()),
         grab: AtomicBool::new(true),
         mods: AtomicU8::new(0),
         tx: Mutex::new(None),
@@ -92,6 +95,15 @@ pub fn install(hwnd: HWND, ui: Ui) {
         if let Err(e) = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), module, 0) {
             tracing::error!("keyboard hook: {e}");
         }
+    }
+}
+
+/// An extra session window opened / closed: it counts as ours for the hook.
+pub fn set_extra_window(hwnd: HWND, open: bool) {
+    let mut v = state().extra.lock().unwrap();
+    v.retain(|h| *h != hwnd.0 as isize);
+    if open {
+        v.push(hwnd.0 as isize);
     }
 }
 
@@ -138,7 +150,8 @@ unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
         HOOK_CALLS.fetch_add(1, Ordering::Relaxed);
         let s = state();
         let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
-        let ours = GetForegroundWindow().0 as isize == s.hwnd.load(Ordering::Relaxed);
+        let fg = GetForegroundWindow().0 as isize;
+        let ours = fg == s.hwnd.load(Ordering::Relaxed) || s.extra.try_lock().is_ok_and(|v| v.contains(&fg));
         // Injected keys are processed too: in cloud desktops / remote sessions
         // every keystroke arrives injected. We never inject locally, so no loop.
         if ours && ACTIVE.load(Ordering::Relaxed) {
