@@ -327,7 +327,13 @@ pub fn session_overlay(
     let pointer = ctx.input(|i| i.pointer.hover_pos());
     let near_top = pointer.is_some_and(|p| p.y < 6.0);
     let on_bar = matches!((pointer, last_rect), (Some(p), Some(r)) if r.expand(16.0).contains(p));
-    let hold = toolbar_open || near_top || on_bar || ctx.memory(|m| m.any_popup_open());
+    // egui menus (display menu, "⋯") are not popups in egui's memory: remember
+    // ourselves that one of the bar's menus was open last frame, or the bar
+    // would hide as soon as the pointer moves down into the menu.
+    let menu_id = egui::Id::new("toolbar-menu-open");
+    let menu_was_open: bool = ctx.data(|d| d.get_temp(menu_id)).unwrap_or(false);
+    let hold = toolbar_open || near_top || on_bar || menu_was_open || ctx.memory(|m| m.any_popup_open());
+    let mut menu_open = false;
     let show_bar = hold || now < open_until;
     if show_bar && !hold {
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -368,8 +374,9 @@ pub fn session_overlay(
                     ui.label(RichText::new(&s.label).strong().color(Color32::WHITE));
                     bar_separator(ui);
 
-                    ui.menu_button(format!("{} ▾", display_title(s)), |ui| displays_menu(ui, s, actions))
-                        .response
+                    let r = ui.menu_button(format!("{} ▾", display_title(s)), |ui| displays_menu(ui, s, actions));
+                    menu_open |= r.inner.is_some();
+                    r.response
                         .on_hover_text("被控端的显示器、虚拟显示器和隐私屏");
 
                     let mode = if s.game { "游戏" } else { "办公" };
@@ -384,7 +391,9 @@ pub fn session_overlay(
                     if ui.toggle_value(&mut fs, "全屏").on_hover_text("Ctrl+Alt+Shift+F").changed() {
                         actions.push(Action::Hotkey(Hotkey::ToggleFullscreen));
                     }
-                    ui.menu_button("⋯", |ui| more_menu(ui, s, actions)).response.on_hover_text("更多");
+                    let r = ui.menu_button("⋯", |ui| more_menu(ui, s, actions));
+                    menu_open |= r.inner.is_some();
+                    r.response.on_hover_text("更多");
                     bar_separator(ui);
                     if ui.button(RichText::new("断开").color(DANGER)).on_hover_text("Ctrl+Alt+Shift+X").clicked() {
                         actions.push(Action::Disconnect);
@@ -393,7 +402,11 @@ pub fn session_overlay(
             });
         });
 
-    let until = if hold { now + 0.8 } else { open_until };
+    ctx.data_mut(|d| d.insert_temp(menu_id, menu_open));
+    if menu_open != menu_was_open {
+        ctx.request_repaint();
+    }
+    let until = if hold || menu_open { now + 0.8 } else { open_until };
     ctx.data_mut(|d| d.insert_temp(state_id, (Some(bar.response.rect), until)));
 
     if !s.status.is_empty() {
