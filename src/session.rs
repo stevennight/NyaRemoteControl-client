@@ -52,6 +52,9 @@ pub struct View {
     pub display_id: u32,
     video_tx: Sender<VideoIn>,
     pub store: Arc<FrameStore>,
+    pub stats: Arc<Shared>,
+    pub summary: Summary,
+    pub server_stats: Option<pb::ServerStats>,
     pub stream: Option<pb::StreamStarted>,
     pub current: Option<Arc<Slot>>,
     pub cursor_visible: bool,
@@ -241,6 +244,7 @@ impl Session {
         self.next_slot += 1;
         let (video_tx, video_rx) = crossbeam_channel::bounded(16);
         let store = Arc::new(FrameStore::default());
+        let stats = Arc::new(Shared::new());
         VideoThread {
             slot,
             hw_allowed: self.hw_decode,
@@ -248,14 +252,28 @@ impl Session {
             store: store.clone(),
             ui: self.ui.clone(),
             net: self.net_tx.clone(),
-            stats: Arc::new(Shared::new()),
+            stats: stats.clone(),
         }
         .spawn(self.dev.clone(), video_rx);
         self.routes.set(slot, Some(video_tx.clone()));
         // Same picture settings as the main window; the display setup is its business.
         let req = pb::StartStream { display_id, slot, display_setup: None, ..self.start.clone() };
         let _ = self.net_tx.send(ctl(Msg::StartStream(req)));
-        self.views.insert(slot, View { display_id, video_tx, store, stream: None, current: None, cursor_visible: true, status: "连接中".into() });
+        self.views.insert(
+            slot,
+            View {
+                display_id,
+                video_tx,
+                store,
+                stats,
+                summary: Summary::default(),
+                server_stats: None,
+                stream: None,
+                current: None,
+                cursor_visible: true,
+                status: "连接中".into(),
+            },
+        );
         tracing::info!("extra window: display {display_id} in slot {slot}");
         slot
     }
@@ -592,6 +610,9 @@ impl Session {
         }
         self.last_tick = Instant::now();
         self.summary = self.stats.take_summary(secs);
+        for v in self.views.values_mut() {
+            v.summary = v.stats.take_summary(secs);
+        }
         let s = &self.summary;
         let _ = self.net_tx.send(ctl(Msg::ClientStats(pb::ClientStats {
             decode_ms_p50: s.decode_ms,
@@ -602,38 +623,62 @@ impl Session {
         true
     }
 
-    /// Lines for the statistics window.
-    pub fn stats_lines(&self) -> Vec<String> {
-        let s = &self.summary;
-        let mut lines = Vec::new();
-        if let Some(st) = &self.stream {
-            let c = st.config.clone().unwrap_or_default();
-            lines.push(format!(
-                "编码 {} {} {}x{}@{}{}",
-                st.encoder_name,
-                if c.chroma == pb::Chroma::Yuv444 as i32 { "4:4:4" } else { "4:2:0" },
-                c.width,
-                c.height,
-                c.fps,
-                if st.cross_gpu { format!("  跨显卡 [{}]→[{}]", st.capture_gpu_index, st.encode_gpu_index) } else { String::new() }
-            ));
-            if st.hdr_tonemapped {
-                lines.push("HDR  被控端显示器开启了 HDR，已转换为 SDR 传输".into());
-            }
+}
+
+/// Statistics lines of one stream.
+fn stream_lines(lines: &mut Vec<String>, stream: Option<&pb::StreamStarted>, server: Option<&pb::ServerStats>, s: &Summary, main: bool) {
+    if let Some(st) = stream {
+        let c = st.config.unwrap_or_default();
+        lines.push(format!(
+            "编码 {} {} {}x{}@{}{}",
+            st.encoder_name,
+            if c.chroma == pb::Chroma::Yuv444 as i32 { "4:4:4" } else { "4:2:0" },
+            c.width,
+            c.height,
+            c.fps,
+            if st.cross_gpu { format!("  跨显卡 [{}]→[{}]", st.capture_gpu_index, st.encode_gpu_index) } else { String::new() }
+        ));
+        if st.hdr_tonemapped {
+            lines.push("HDR  被控端显示器开启了 HDR，已转换为 SDR 传输".into());
         }
-        let (sfps, skbps, enc_ms, xfer_ms, target, note) = self
-            .server_stats
-            .as_ref()
-            .map(|x| (x.fps, x.bitrate_kbps, x.encode_ms_p50, x.transfer_ms_p50, x.target_kbps, x.bitrate_note.clone()))
-            .unwrap_or_default();
-        lines.push(format!("帧率  被控端 {sfps} / 本机 {}   丢帧 {}", s.fps, s.dropped));
-        lines.push(format!("码率  实际 {:.1} Mbps   上限 {:.1} Mbps", skbps.max(s.kbps) as f32 / 1000.0, target as f32 / 1000.0));
-        if !note.is_empty() {
-            lines.push(format!("策略  {note}"));
-        }
+    }
+    let (sfps, skbps, enc_ms, xfer_ms, target, note) = server
+        .map(|x| (x.fps, x.bitrate_kbps, x.encode_ms_p50, x.transfer_ms_p50, x.target_kbps, x.bitrate_note.clone()))
+        .unwrap_or_default();
+    lines.push(format!("帧率  被控端 {sfps} / 本机 {}   丢帧 {}", s.fps, s.dropped));
+    let kbps = if main { skbps.max(s.kbps) } else { skbps };
+    lines.push(format!("码率  实际 {:.1} Mbps   上限 {:.1} Mbps", kbps as f32 / 1000.0, target as f32 / 1000.0));
+    if main && !note.is_empty() {
+        lines.push(format!("策略  {note}"));
+    }
+    if main {
         lines.push(format!("延迟  端到端 {:.1} ms   RTT {:.1} ms", s.latency_ms, s.rtt_ms));
-        lines.push(format!("耗时  编码 {enc_ms:.1}  跨显卡 {xfer_ms:.1}  解码 {:.1}  渲染 {:.1} ms", s.decode_ms, s.render_ms));
-        lines.push(format!("解码器  {}", s.decoder));
+    } else {
+        lines.push(format!("延迟  端到端 {:.1} ms", s.latency_ms));
+    }
+    lines.push(format!("耗时  编码 {enc_ms:.1}  跨显卡 {xfer_ms:.1}  解码 {:.1}  渲染 {:.1} ms", s.decode_ms, s.render_ms));
+    lines.push(format!("解码器  {}", s.decoder));
+}
+
+impl Session {
+    /// Lines for the statistics window: the main window's stream, then one
+    /// block per extra window.
+    pub fn stats_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        let many = !self.views.is_empty();
+        if many {
+            let title = self.stream.as_ref().map(|s| self.display_title(s.display_id)).unwrap_or_else(|| "主窗口".into());
+            lines.push(format!("── 主窗口 · {title} ──"));
+        }
+        stream_lines(&mut lines, self.stream.as_ref(), self.server_stats.as_ref(), &self.summary, true);
+        for v in self.views.values() {
+            lines.push(String::new());
+            lines.push(format!("── 窗口 · {} ──", self.display_title(v.display_id)));
+            if !v.status.is_empty() {
+                lines.push(v.status.clone());
+            }
+            stream_lines(&mut lines, v.stream.as_ref(), v.server_stats.as_ref(), &v.summary, false);
+        }
         lines
     }
 

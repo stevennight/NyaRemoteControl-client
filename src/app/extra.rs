@@ -24,7 +24,7 @@ pub(super) struct ExtraWindow {
     renderer: Renderer,
     gui: Gui,
     remote_buttons: u8,
-    fullscreen: bool,
+    pub fullscreen: bool,
     focused: bool,
 }
 
@@ -75,6 +75,8 @@ impl App {
         let slot = s.open_view(display_id);
         self.extras.insert(window.id(), ExtraWindow { slot, window: window.clone(), renderer, gui, remote_buttons: 0, fullscreen: false, focused: true });
         window.request_redraw();
+        // A virtual screen shown here takes this window's size.
+        self.schedule_vd_fit();
     }
 
     pub(super) fn close_extra(&mut self, id: WindowId) {
@@ -120,6 +122,30 @@ impl App {
         }
     }
 
+    /// A window showing a virtual screen changed size: resize the screens soon
+    /// (after the drag ends: an unusual size restarts the virtual display driver).
+    pub(super) fn schedule_vd_fit(&mut self) {
+        if self.session.as_ref().is_some_and(|s| s.vd_follow_window) {
+            self.vd_resize_at = Some(std::time::Instant::now() + std::time::Duration::from_millis(800));
+        }
+    }
+
+    /// Add a virtual screen to the host and show it in a new window.
+    pub(super) fn new_virtual_window(&mut self) {
+        let Some(s) = self.session.as_mut() else { return };
+        let mut c = s.display_choice();
+        if c.count >= 4 {
+            s.notice("最多 4 个虚拟显示器".into(), std::time::Duration::from_secs(4));
+            return;
+        }
+        c.count += 1;
+        self.pending_virtual = Some(c.count);
+        let setup = self.setup_request(c, self.fullscreen);
+        if let Some(s) = self.session.as_mut() {
+            s.set_display_setup(setup);
+        }
+    }
+
     /// Host displays changed: with "one window per display", open windows for
     /// new displays; windows whose display is gone close.
     pub(super) fn sync_extras(&mut self) {
@@ -136,6 +162,14 @@ impl App {
             self.close_extra(id);
         }
         let Some(s) = self.session.as_ref() else { return };
+        // A virtual screen created for a new window has appeared: open it.
+        if let Some(idx) = self.pending_virtual {
+            if let Some(d) = s.info.as_ref().and_then(|i| i.displays.iter().find(|d| d.virtual_index == idx)) {
+                self.pending_virtual = None;
+                self.auto_opened.0.insert(d.id);
+                self.open_requests.push(d.id);
+            }
+        }
         if !self.cfg.defaults.multi_window || !s.multi_supported {
             return;
         }
@@ -163,6 +197,7 @@ impl App {
                     tracing::warn!("extra window resize: {e:#}");
                 }
                 window.request_redraw();
+                self.schedule_vd_fit();
             }
             WindowEvent::RedrawRequested => self.draw_extra(id),
             WindowEvent::Focused(f) => {
@@ -241,9 +276,20 @@ impl App {
         let Some(s) = self.session.as_mut() else { return };
         let title = s.display_title(s.views.get(&w.slot).map(|v| v.display_id).unwrap_or(0));
         let Some(v) = s.views.get_mut(&w.slot) else { return };
-        let (slot, _fresh) = v.store.take();
+        let (slot, fresh) = v.store.take();
         if slot.is_some() {
             v.current = slot;
+        }
+        if fresh {
+            // Latency needs the clock offset, which the main statistics keep.
+            let lat = v.current.as_ref().map(|c| s.stats.latency_ms(c.capture_ts));
+            v.stats.with(|st| {
+                st.frames_rendered += 1;
+                st.total_rendered += 1;
+                if let Some(l) = lat {
+                    st.latency_ms.push(l);
+                }
+            });
         }
         let status = v.status.clone();
         let current = v.current.clone();

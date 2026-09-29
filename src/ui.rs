@@ -15,6 +15,8 @@ pub enum Action {
     SelectDisplay(u32),
     /// Show this host display in an extra window.
     OpenWindow(u32),
+    /// Add a virtual screen to the host and show it in a new window.
+    NewVirtualWindow,
     SetDisplayChoice(crate::session::DisplayChoice),
     SetGrab(bool),
     SetPolicy(nya_proto::pb::BitratePolicy),
@@ -140,6 +142,16 @@ fn displays_menu(ui: &mut egui::Ui, s: &Session, actions: &mut Vec<Action>) {
                     }
                 }
             });
+        }
+    }
+    if s.multi_supported && s.vd_available() && s.display_choice().count < 4 {
+        if ui
+            .button("＋ 新建虚拟屏，在新窗口显示")
+            .on_hover_text("在被控端多建一个虚拟显示器，分辨率跟随新窗口的大小。可以把几个窗口并排放在本机的同一块屏幕上")
+            .clicked()
+        {
+            actions.push(Action::NewVirtualWindow);
+            ui.close_menu();
         }
     }
     ui.separator();

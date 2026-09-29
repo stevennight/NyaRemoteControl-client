@@ -84,6 +84,8 @@ pub struct App {
     auto_opened: extra::AutoOpened,
     /// Host displays or the main stream changed: check the extra windows.
     sync_extras: bool,
+    /// Virtual screen (1-based) created for a new window, until it appears.
+    pending_virtual: Option<u32>,
 }
 
 fn hwnd(window: &Window) -> Option<windows::Win32::Foundation::HWND> {
@@ -199,6 +201,7 @@ impl App {
             open_requests: Vec::new(),
             auto_opened: Default::default(),
             sync_extras: false,
+            pending_virtual: None,
         }
     }
 
@@ -248,8 +251,57 @@ impl App {
         if count == 0 && !c.block_input {
             return None;
         }
+        let main = self.window.as_ref()?;
+        let follow = !matches!(self.cfg.defaults.vd_size.as_str(), "fixed" | "screen");
+        let displays = self.session.as_ref().and_then(|s| s.info.as_ref()).map(|i| i.displays.clone()).unwrap_or_default();
+        let mut screens = Vec::new();
+        for i in 1..=count {
+            let shown = displays.iter().find(|d| d.virtual_index == i);
+            // "Follow the window": each virtual screen takes the size of the
+            // window that shows it; a screen no window shows keeps its size.
+            let screen = if follow {
+                match shown.map(|d| (d, self.window_showing(d.id))) {
+                    Some((_, Some((w, fs)))) => self.virtual_screen(&w, fs),
+                    Some((d, None)) => Some(pb::VirtualScreen {
+                        width: d.width,
+                        height: d.height,
+                        refresh_hz: d.refresh_hz,
+                        scale_percent: self.virtual_screen(main, fullscreen).map(|s| s.scale_percent).unwrap_or(0),
+                    }),
+                    None => self.virtual_screen(main, fullscreen),
+                }
+            } else {
+                self.virtual_screen(main, fullscreen)
+            };
+            // A minimized window has no size: keep what the host has.
+            let screen = screen.or_else(|| shown.map(|d| pb::VirtualScreen { width: d.width, height: d.height, refresh_hz: d.refresh_hz, scale_percent: 0 }));
+            screens.push(screen.unwrap_or(pb::VirtualScreen { width: 1920, height: 1080, refresh_hz: 60, scale_percent: 0 }));
+        }
+        Some(pb::DisplaySetup {
+            virtual_screens: screens,
+            physical_off: c.physical_off && count > 0,
+            block_local_input: c.block_input,
+        })
+    }
+
+    /// The window currently showing host display `id` (main or extra) and
+    /// whether it is fullscreen.
+    fn window_showing(&self, id: u32) -> Option<(Arc<Window>, bool)> {
+        let s = self.session.as_ref()?;
+        if s.stream.as_ref().is_some_and(|st| st.display_id == id) {
+            return self.window.clone().map(|w| (w, self.fullscreen));
+        }
+        let slot = s.view_of(id)?;
+        self.extras.values().find(|w| w.slot == slot).map(|w| (w.window.clone(), w.fullscreen))
+    }
+
+    /// A virtual screen sized for `w` (following the settings); `None` while
+    /// the window is minimized.
+    fn virtual_screen(&self, w: &Window, fullscreen: bool) -> Option<pb::VirtualScreen> {
         let d = &self.cfg.defaults;
-        let w = self.window.as_ref()?;
+        if w.is_minimized() == Some(true) || w.inner_size().width == 0 {
+            return None;
+        }
         let monitor = w.current_monitor();
         let monitor_size = monitor.as_ref().map(|m| (m.size().width, m.size().height)).unwrap_or((1920, 1080));
         let (width, height) = match d.vd_size.as_str() {
@@ -261,17 +313,7 @@ impl App {
         };
         let (width, height) = vd_dims(width, height);
         let refresh_hz = monitor.and_then(|m| m.refresh_rate_millihertz()).map(|mhz| (mhz + 500) / 1000).unwrap_or(60);
-        let screen = pb::VirtualScreen {
-            width,
-            height,
-            refresh_hz,
-            scale_percent: if d.vd_scale { (w.scale_factor() * 100.0).round() as u32 } else { 0 },
-        };
-        Some(pb::DisplaySetup {
-            virtual_screens: vec![screen; count as usize],
-            physical_off: c.physical_off && count > 0,
-            block_local_input: c.block_input,
-        })
+        Some(pb::VirtualScreen { width, height, refresh_hz, scale_percent: if d.vd_scale { (w.scale_factor() * 100.0).round() as u32 } else { 0 } })
     }
 
     /// The window size settled: fit the virtual screens to it.
@@ -279,9 +321,6 @@ impl App {
         let Some(s) = self.session.as_ref() else { return };
         let choice = s.display_choice();
         if !s.vd_follow_window || choice.count == 0 {
-            return;
-        }
-        if self.window.as_ref().is_some_and(|w| w.is_minimized() == Some(true) || w.inner_size().width == 0) {
             return;
         }
         let setup = self.setup_request(choice, self.fullscreen);
@@ -559,6 +598,7 @@ impl App {
                     }
                 }
                 Action::OpenWindow(display_id) => self.open_requests.push(display_id),
+                Action::NewVirtualWindow => self.new_virtual_window(),
                 Action::SetDisplayChoice(choice) => {
                     let setup = self.setup_request(choice, self.fullscreen);
                     if let Some(s) = &mut self.session {
@@ -1196,6 +1236,11 @@ impl ApplicationHandler<UiEvent> for App {
                     UiEvent::StreamError(_, e) => {
                         tracing::error!("stream error: {e}");
                         s.status = format!("被控端无法开始推流：{e}");
+                    }
+                    UiEvent::ServerStats(st) if st.slot != 0 => {
+                        if let Some(v) = s.views.get_mut(&st.slot) {
+                            v.server_stats = Some(st);
+                        }
                     }
                     UiEvent::ServerStats(st) => s.server_stats = Some(st),
                     UiEvent::Clipboard(t) => s.clipboard_from_host(t),
