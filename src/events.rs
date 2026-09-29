@@ -13,6 +13,10 @@ pub enum NetCmd {
     SendFiles(Vec<std::path::PathBuf>),
     /// Local clipboard image (CF_DIB) for the host.
     SendImage(Vec<u8>),
+    /// Files were copied here: offer them to the host.
+    OfferFiles(Vec<std::path::PathBuf>),
+    /// The host's files (offer id) are being pasted here: fetch them.
+    ClipboardPaste(u64, crate::transfer::PasteReply),
     /// Encoded MIC datagram.
     Mic(Vec<u8>),
     Quit,
@@ -71,6 +75,8 @@ pub enum UiEvent {
     Hotkey(Hotkey),
     ConnectDone(ConnectDone),
     FileOffer(pb::FileOffer),
+    /// The host copied files; they are on our clipboard now (paste to fetch).
+    ClipOffer(pb::FileOffer),
     FileResult(pb::FileResult),
     Transfer(TransferUpdate),
     UsbStatus(pb::UsbStatus),

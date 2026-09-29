@@ -1,5 +1,6 @@
 //! Client side of file transfer: uploads (drag & drop / "发送文件"),
-//! downloads of files offered by the host, and clipboard images.
+//! downloads of files offered by the host, clipboard images, and files copied
+//! on one side and pasted on the other ([`ClipFiles`]).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -77,6 +78,7 @@ pub async fn upload(conn: Connection, paths: Vec<PathBuf>, ui: Ui) {
             purpose: pb::FilePurpose::Save as i32,
             index: i as u32,
             count,
+            path: String::new(),
         };
         if let Err(e) = files::send_file(&conn, h, p, |n| prog.add(n)).await {
             prog.finish(Err(format!("发送 {} 失败：{e:#}", p.display())), None);
@@ -96,9 +98,97 @@ pub async fn send_image(conn: Connection, dib: Vec<u8>) {
         purpose: pb::FilePurpose::ClipboardImage as i32,
         index: 0,
         count: 1,
+        path: String::new(),
     };
     if let Err(e) = files::send_bytes(&conn, h, &dib).await {
         tracing::debug!("clipboard image: {e:#}");
+    }
+}
+
+pub type PasteReply = std::sync::mpsc::Sender<Result<Vec<PathBuf>, String>>;
+
+/// Copied files between the two computers (FEATURE_CLIPBOARD_FILES): what the
+/// network tasks share. Lives as long as the session (across reconnects).
+pub struct ClipFiles {
+    /// Host files on our clipboard; fetched into `cache` when pasted.
+    pub incoming: nya_transport::clipfiles::Incoming,
+    /// Files copied here, offered to the host.
+    pub outgoing: Mutex<nya_transport::clipfiles::Outgoing>,
+    cache: PathBuf,
+    /// Pastes waiting for their files.
+    waiters: Mutex<HashMap<u64, Vec<PasteReply>>>,
+    /// Offer id -> (total bytes, bytes received so far).
+    progress: Mutex<HashMap<u64, (u64, u64)>>,
+}
+
+impl ClipFiles {
+    pub fn new() -> Self {
+        let cache = nya_win::shell::clipboard_cache_dir(None).unwrap_or_else(|| std::env::temp_dir().join("NyaRemoteControl").join("clipboard"));
+        let c = cache.clone();
+        std::thread::spawn(move || files::prune_cache(&c));
+        Self { incoming: Default::default(), outgoing: Default::default(), cache, waiters: Default::default(), progress: Default::default() }
+    }
+
+    /// The host copied files.
+    pub fn register(&self, o: &pb::FileOffer) {
+        self.incoming.register(o, &self.cache);
+        let total = o.files.iter().map(|f| f.size).sum();
+        self.progress.lock().unwrap().insert(o.transfer_id, (total, 0));
+    }
+
+    pub fn wait(&self, id: u64, reply: PasteReply) {
+        self.waiters.lock().unwrap().entry(id).or_default().push(reply);
+    }
+
+    /// Tell every paste waiting for `id`.
+    pub fn finish(&self, id: u64, r: Result<Vec<PathBuf>, String>) {
+        for w in self.waiters.lock().unwrap().remove(&id).unwrap_or_default() {
+            let _ = w.send(r.clone());
+        }
+    }
+
+    /// The connection ended: nothing that was requested will arrive.
+    pub fn fail_all(&self, msg: &str) {
+        for id in self.incoming.fail_all(msg) {
+            self.finish(id, Err(msg.to_owned()));
+        }
+    }
+}
+
+impl Default for ClipFiles {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Send files the host asked for because they are being pasted there.
+/// A failure is reported to the host through `fail`.
+pub async fn send_clipboard_files(
+    conn: Connection,
+    id: u64,
+    items: Vec<files::Item>,
+    ui: Ui,
+    fail: tokio::sync::mpsc::UnboundedSender<pb::ControlMsg>,
+) {
+    let total = items.iter().map(|i| i.size).sum();
+    let count = items.iter().filter(|i| !i.is_dir).count();
+    let mut prog = Progress::new(ui, id, true, total);
+    let r = nya_transport::clipfiles::send_items(&conn, id, &items, pb::FilePurpose::Clipboard, |name, n| {
+        if prog.update.name != name {
+            prog.update.name = name.to_owned();
+        }
+        prog.add(n);
+    })
+    .await;
+    match r {
+        Ok(()) => prog.finish(Ok(format!("已发送 {count} 个文件（在被控端粘贴）")), None),
+        Err(e) => {
+            let msg = format!("客户端发送文件失败：{e:#}");
+            let _ = fail.send(pb::ControlMsg {
+                msg: Some(pb::control_msg::Msg::FileResult(pb::FileResult { transfer_id: id, ok: false, message: msg.clone(), saved_to: String::new() })),
+            });
+            prog.finish(Err(msg), None);
+        }
     }
 }
 
@@ -109,7 +199,7 @@ pub struct Downloads {
 }
 
 /// A FILE stream from the host (after the type varint).
-pub async fn receive(mut r: RecvStream, ui: Ui, downloads: Arc<Downloads>, files_on: bool, images_on: bool) {
+pub async fn receive(mut r: RecvStream, ui: Ui, downloads: Arc<Downloads>, clip: Arc<ClipFiles>, (files_on, images_on, clip_on): (bool, bool, bool)) {
     let h = match files::read_header(&mut r).await {
         Ok(h) => h,
         Err(e) => return tracing::warn!("file header: {e:#}"),
@@ -119,6 +209,29 @@ pub async fn receive(mut r: RecvStream, ui: Ui, downloads: Arc<Downloads>, files
             Ok(dib) => ui.send(UiEvent::ClipboardImage(dib)),
             Err(e) => tracing::debug!("clipboard image: {e:#}"),
         },
+        pb::FilePurpose::Clipboard if clip_on => {
+            let id = h.transfer_id;
+            let Some(root) = clip.incoming.root(id) else {
+                let _ = r.stop(0u32.into());
+                return;
+            };
+            let (total, already) = clip.progress.lock().unwrap().get(&id).copied().unwrap_or((0, 0));
+            let mut prog = Progress::new(ui.clone(), id, false, total);
+            prog.update.name = if h.path.is_empty() { h.name.clone() } else { h.path.clone() };
+            prog.update.done = already;
+            let res = files::receive_to_tree(&mut r, &h, &root, |n| prog.add(n)).await;
+            if let Some(p) = clip.progress.lock().unwrap().get_mut(&id) {
+                p.1 += h.size;
+            }
+            let res = res.map(|_| ()).map_err(|e| format!("接收 {} 失败：{e:#}", prog.update.name));
+            if let Some(done) = clip.incoming.file_done(id, res) {
+                match &done {
+                    Ok(items) => prog.finish(Ok(format!("已接收 {} 项，正在粘贴", items.len())), Some(root)),
+                    Err(e) => prog.finish(Err(e.clone()), None),
+                }
+                clip.finish(id, done);
+            }
+        }
         pb::FilePurpose::Save if files_on => {
             let dir = nya_win::shell::receive_dir(None).unwrap_or_else(|| std::env::temp_dir().join("NyaRemoteControl"));
             let already = downloads.batches.lock().unwrap().get(&h.transfer_id).map(|b| b.1).unwrap_or(0);

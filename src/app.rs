@@ -1059,6 +1059,11 @@ impl ApplicationHandler<UiEvent> for App {
             }
             UiEvent::Hotkey(h) => self.hotkey(h),
             UiEvent::Disconnected(msg) => self.end_session(Some((Kind::Error, msg))),
+            UiEvent::ClipOffer(o) => {
+                if let Some(s) = &mut self.session {
+                    s.on_clip_offer(o);
+                }
+            }
             UiEvent::FileOffer(o) => {
                 if let Some(s) = &mut self.session {
                     s.on_offer(o);

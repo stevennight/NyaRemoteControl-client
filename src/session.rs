@@ -130,15 +130,16 @@ impl Session {
         if opts.audio {
             crate::audio::spawn(audio_rx);
         }
+        let clip_files = link.neg.has(nya_proto::pb::Feature::FileTransfer) && link.neg.has(nya_proto::pb::Feature::ClipboardFiles);
         let clip_tx = opts.clipboard.then(|| {
             let (tx, rx) = crossbeam_channel::unbounded();
-            crate::clipboard::spawn(rx, net_tx.clone());
+            crate::clipboard::spawn(rx, net_tx.clone(), clip_files);
             tx
         });
         input::set_session(Some(net_tx.clone()));
 
         let start = params.start.clone();
-        let sinks = Sinks { ui, video: video_tx.clone(), audio: audio_tx, stats: stats.clone() };
+        let sinks = Sinks { ui, video: video_tx.clone(), audio: audio_tx, stats: stats.clone(), clip: Default::default() };
         rt.spawn(net::supervise(link, params, net_rx, sinks));
 
         Self {
@@ -373,7 +374,7 @@ impl Session {
             state: TransferState::Running,
             folder: None,
         });
-        let _ = self.net_tx.send(ctl(Msg::FileRequest(pb::FileRequest { transfer_id: id })));
+        let _ = self.net_tx.send(ctl(Msg::FileRequest(pb::FileRequest { transfer_id: id, purpose: pb::FilePurpose::Save as i32 })));
     }
 
     pub fn dismiss_offer(&mut self, id: u64) {
@@ -382,6 +383,14 @@ impl Session {
 
     pub fn dismiss_transfer(&mut self, id: u64) {
         self.transfers.retain(|t| t.id != id);
+    }
+
+    /// The host copied files: they are on our clipboard now.
+    pub fn on_clip_offer(&mut self, o: pb::FileOffer) {
+        let Some(tx) = &self.clip_tx else { return self.on_offer(o) };
+        let _ = tx.send(ClipIn::Offer(o.transfer_id));
+        let top = o.files.iter().filter(|f| !f.path.contains('/')).count().max(1);
+        self.notice(format!("被控端复制了 {top} 项，可以在本机粘贴"), Duration::from_secs(4));
     }
 
     pub fn on_offer(&mut self, o: pb::FileOffer) {

@@ -112,6 +112,7 @@ pub struct Sinks {
     pub video: Sender<VideoIn>,
     pub audio: Sender<AudioPacket>,
     pub stats: Arc<Shared>,
+    pub clip: Arc<crate::transfer::ClipFiles>,
 }
 
 enum End {
@@ -200,13 +201,18 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
 
     let files_on = neg.has(Feature::FileTransfer);
     let images_on = neg.has(Feature::ClipboardImage);
+    // Copy on one side, paste on the other (folders too), both directions.
+    let clip_on = files_on && neg.has(Feature::ClipboardFiles);
     let uni = tokio::spawn(accept_uni(
         conn.clone(),
         sinks.video.clone(),
         sinks.ui.clone(),
         sinks.stats.clone(),
-        (files_on, images_on),
+        sinks.clip.clone(),
+        (files_on, images_on, clip_on),
     ));
+    // Control messages from spawned tasks (failed clipboard sends).
+    let (internal_tx, mut internal_rx) = mpsc::unbounded_channel::<pb::ControlMsg>();
     let usb_on = neg.has(Feature::UsbRedirect);
     let bidi = tokio::spawn({
         let conn = conn.clone();
@@ -248,8 +254,33 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
                     Some(Msg::ServerStats(s)) => sinks.ui.send(UiEvent::ServerStats(s)),
                     Some(Msg::ClipboardText(c)) if clipboard => sinks.ui.send(UiEvent::Clipboard(c.text)),
                     Some(Msg::Pong(p)) => sinks.stats.on_pong(p.t_us, p.server_t_us),
+                    Some(Msg::FileOffer(o)) if clip_on => {
+                        tracing::info!("host copied {} item(s) (offer {:016x})", o.files.len(), o.transfer_id);
+                        sinks.clip.register(&o);
+                        sinks.ui.send(UiEvent::ClipOffer(o));
+                    }
                     Some(Msg::FileOffer(o)) if files_on => sinks.ui.send(UiEvent::FileOffer(o)),
-                    Some(Msg::FileResult(r)) => sinks.ui.send(UiEvent::FileResult(r)),
+                    Some(Msg::FileRequest(req)) if clip_on => {
+                        let items = sinks.clip.outgoing.lock().unwrap().items(req.transfer_id);
+                        match items {
+                            Some(items) => {
+                                tracing::info!("host is pasting our files (offer {:016x})", req.transfer_id);
+                                tokio::spawn(crate::transfer::send_clipboard_files(conn.clone(), req.transfer_id, items, sinks.ui.clone(), internal_tx.clone()));
+                            }
+                            None => {
+                                let r = pb::FileResult { transfer_id: req.transfer_id, ok: false, message: "这批文件已过期，请在客户端重新复制".into(), saved_to: String::new() };
+                                let _ = internal_tx.send(ctl(Msg::FileResult(r)));
+                            }
+                        }
+                    }
+                    Some(Msg::FileResult(r)) => {
+                        if !r.ok {
+                            if let Some(Err(e)) = sinks.clip.incoming.fail(r.transfer_id, r.message.clone()) {
+                                sinks.clip.finish(r.transfer_id, Err(e));
+                            }
+                        }
+                        sinks.ui.send(UiEvent::FileResult(r));
+                    }
                     Some(Msg::UsbStatus(u)) => sinks.ui.send(UiEvent::UsbStatus(u)),
                     Some(Msg::GamepadRumble(r)) => sinks.ui.send(UiEvent::GamepadRumble(r)),
                     Some(Msg::Bye(b)) => break End::Fatal(format!("被控端断开：{}", b.reason)),
@@ -293,6 +324,33 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
                         tokio::spawn(crate::transfer::send_image(conn.clone(), dib));
                     }
                 }
+                Some(NetCmd::OfferFiles(paths)) => {
+                    if clip_on {
+                        let offer = sinks.clip.outgoing.lock().unwrap().offer(&paths, true);
+                        if let Some(o) = offer {
+                            tracing::info!("offering {} copied item(s) to the host", o.files.len());
+                            if let Err(e) = write_msg(&mut send, &ctl(Msg::FileOffer(o))).await {
+                                break End::Lost(format!("control: {e}"));
+                            }
+                        }
+                    }
+                }
+                Some(NetCmd::ClipboardPaste(id, reply)) => {
+                    use nya_transport::clipfiles::Paste;
+                    match sinks.clip.incoming.paste(id) {
+                        Paste::Ready(p) => { let _ = reply.send(Ok(p)); }
+                        Paste::Request => {
+                            sinks.clip.wait(id, reply);
+                            let req = pb::FileRequest { transfer_id: id, purpose: pb::FilePurpose::Clipboard as i32 };
+                            if let Err(e) = write_msg(&mut send, &ctl(Msg::FileRequest(req))).await {
+                                break End::Lost(format!("control: {e}"));
+                            }
+                        }
+                        Paste::Wait => sinks.clip.wait(id, reply),
+                        Paste::Failed(e) => { let _ = reply.send(Err(e)); }
+                        Paste::Unknown => { let _ = reply.send(Err("这批文件已过期，请在被控端重新复制".into())); }
+                    }
+                }
                 Some(NetCmd::Quit) | None => {
                     let _ = write_msg(&mut send, &ctl(Msg::Bye(pb::Bye { reason: "用户断开".into() }))).await;
                     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -300,6 +358,11 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
                     break End::UserQuit;
                 }
             },
+            Some(m) = internal_rx.recv() => {
+                if let Err(e) = write_msg(&mut send, &m).await {
+                    break End::Lost(format!("control: {e}"));
+                }
+            }
             _ = ping.tick() => {
                 let _ = write_msg(&mut send, &ctl(Msg::Ping(pb::Ping { t_us: nya_proto::now_us() }))).await;
             }
@@ -309,16 +372,25 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
     uni.abort();
     bidi.abort();
     dgram.abort();
+    // The host starts over after a reconnect: pastes in progress can't finish.
+    sinks.clip.fail_all("与被控端的连接断开了");
     end
 }
 
-async fn accept_uni(conn: Connection, video: Sender<VideoIn>, ui: Ui, stats: Arc<Shared>, (files_on, images_on): (bool, bool)) {
+async fn accept_uni(
+    conn: Connection,
+    video: Sender<VideoIn>,
+    ui: Ui,
+    stats: Arc<Shared>,
+    clip: Arc<crate::transfer::ClipFiles>,
+    flags: (bool, bool, bool),
+) {
     let downloads = Arc::new(crate::transfer::Downloads::default());
     while let Ok(mut r) = conn.accept_uni().await {
-        let (video, ui, stats, downloads) = (video.clone(), ui.clone(), stats.clone(), downloads.clone());
+        let (video, ui, stats, downloads, clip) = (video.clone(), ui.clone(), stats.clone(), downloads.clone(), clip.clone());
         tokio::spawn(async move {
             match read_varint(&mut r).await {
-                Ok(Some(stream_type::FILE)) => crate::transfer::receive(r, ui, downloads, files_on, images_on).await,
+                Ok(Some(stream_type::FILE)) => crate::transfer::receive(r, ui, downloads, clip, flags).await,
                 Ok(Some(stream_type::VIDEO)) => {
                     let Ok(Some(stream_id)) = read_varint(&mut r).await else { return };
                     tracing::info!("video stream {stream_id} opened by host");
