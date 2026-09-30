@@ -310,36 +310,29 @@ fn more_menu(ui: &mut egui::Ui, s: &Session, actions: &mut Vec<Action>) {
     });
 }
 
-/// Toolbar and statistics shown over the remote picture.
-pub fn session_overlay(
-    ctx: &egui::Context,
-    s: &mut Session,
-    toolbar_open: bool,
-    fullscreen: bool,
-    hovering_file: bool,
-    actions: &mut Vec<Action>,
-) {
-    // The bar opens at the top edge and stays open while the pointer is on it
-    // (plus a margin), and for a moment after it leaves.
-    let state_id = egui::Id::new("toolbar-state");
-    let (last_rect, open_until): (Option<egui::Rect>, f64) = ctx.data(|d| d.get_temp(state_id)).unwrap_or((None, 0.0));
+/// A bar at the top of a session window that shows while the pointer is at
+/// the top edge or on it (or `pinned`), stays while one of its menus is open,
+/// and hides a moment after the pointer leaves; hidden, a thin tab with
+/// `tab` remains. `contents` draws the bar and sets its `bool` when a menu of
+/// the bar is open. `id` keeps separate bars apart.
+pub fn auto_hide_bar(ctx: &egui::Context, id: &str, pinned: bool, tab: &str, contents: impl FnOnce(&mut egui::Ui, &mut bool)) {
+    let state_id = egui::Id::new((id, "state"));
+    let (last_rect, open_until, menu_was_open): (Option<egui::Rect>, f64, bool) =
+        ctx.data(|d| d.get_temp(state_id)).unwrap_or((None, 0.0, false));
     let now = ctx.input(|i| i.time);
     let pointer = ctx.input(|i| i.pointer.hover_pos());
     let near_top = pointer.is_some_and(|p| p.y < 6.0);
     let on_bar = matches!((pointer, last_rect), (Some(p), Some(r)) if r.expand(16.0).contains(p));
-    // egui menus (display menu, "⋯") are not popups in egui's memory: remember
-    // ourselves that one of the bar's menus was open last frame, or the bar
-    // would hide as soon as the pointer moves down into the menu.
-    let menu_id = egui::Id::new("toolbar-menu-open");
-    let menu_was_open: bool = ctx.data(|d| d.get_temp(menu_id)).unwrap_or(false);
-    let hold = toolbar_open || near_top || on_bar || menu_was_open || ctx.memory(|m| m.any_popup_open());
-    let mut menu_open = false;
+    // egui menus (display menu, "⋯") are not popups in egui's memory: the bar
+    // remembers that one of its menus was open, or it would hide as soon as
+    // the pointer moves down into the menu.
+    let hold = pinned || near_top || on_bar || menu_was_open || ctx.memory(|m| m.any_popup_open());
     let show_bar = hold || now < open_until;
     if show_bar && !hold {
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
-
-    let bar = egui::Area::new(egui::Id::new("toolbar"))
+    let mut menu_open = false;
+    let bar = egui::Area::new(egui::Id::new(id))
         .anchor(Align2::CENTER_TOP, [0.0, if show_bar { 8.0 } else { 0.0 }])
         .order(egui::Order::Foreground)
         .show(ctx, |ui| {
@@ -352,7 +345,7 @@ pub fn session_overlay(
                 frame
                     .corner_radius(egui::CornerRadius { nw: 0, ne: 0, sw: 8, se: 8 })
                     .inner_margin(egui::Margin::symmetric(12, 2))
-                    .show(ui, |ui| ui.label(RichText::new(format!("▾ {}", s.label)).small().color(DIM)));
+                    .show(ui, |ui| ui.label(RichText::new(format!("▾ {tab}")).small().color(DIM)));
                 return;
             }
             frame.corner_radius(12).inner_margin(egui::Margin::same(4)).show(ui, |ui| {
@@ -366,48 +359,74 @@ pub fn session_overlay(
                     w.hovered.weak_bg_fill = Color32::from_white_alpha(22);
                     w.hovered.bg_fill = Color32::from_white_alpha(22);
                 }
-                ui.horizontal(|ui| {
-                    ui.add_space(8.0);
-                    let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                    ui.painter().circle_filled(dot.center(), 3.5, OK);
-                    ui.add_space(4.0);
-                    ui.label(RichText::new(&s.label).strong().color(Color32::WHITE));
-                    bar_separator(ui);
-
-                    let r = ui.menu_button(format!("{} ▾", display_title(s)), |ui| displays_menu(ui, s, actions));
-                    menu_open |= r.inner.is_some();
-                    r.response
-                        .on_hover_text("被控端的显示器、虚拟显示器和隐私屏");
-
-                    let mode = if s.game { "游戏" } else { "办公" };
-                    if ui.button(mode).on_hover_text("办公（清晰）/ 游戏（流畅）切换，Ctrl+Alt+Shift+M").clicked() {
-                        actions.push(Action::SetGameMode(!s.game));
-                    }
-                    let mut grab = input::grabbed();
-                    if ui.toggle_value(&mut grab, "键盘").on_hover_text("捕获键盘：Win 键等组合键发给被控端，Ctrl+Alt+Shift+Q").changed() {
-                        actions.push(Action::SetGrab(grab));
-                    }
-                    let mut fs = fullscreen;
-                    if ui.toggle_value(&mut fs, "全屏").on_hover_text("Ctrl+Alt+Shift+F").changed() {
-                        actions.push(Action::Hotkey(Hotkey::ToggleFullscreen));
-                    }
-                    let r = ui.menu_button("⋯", |ui| more_menu(ui, s, actions));
-                    menu_open |= r.inner.is_some();
-                    r.response.on_hover_text("更多");
-                    bar_separator(ui);
-                    if ui.button(RichText::new("断开").color(DANGER)).on_hover_text("Ctrl+Alt+Shift+X").clicked() {
-                        actions.push(Action::Disconnect);
-                    }
-                });
+                contents(ui, &mut menu_open);
             });
         });
-
-    ctx.data_mut(|d| d.insert_temp(menu_id, menu_open));
     if menu_open != menu_was_open {
         ctx.request_repaint();
     }
     let until = if hold || menu_open { now + 0.8 } else { open_until };
-    ctx.data_mut(|d| d.insert_temp(state_id, (Some(bar.response.rect), until)));
+    // Keep the last shown rectangle: the tab is much smaller than the bar.
+    let rect = if show_bar { Some(bar.response.rect) } else { last_rect };
+    ctx.data_mut(|d| d.insert_temp(state_id, (rect, until, menu_open)));
+}
+
+/// Toolbar and statistics shown over the remote picture.
+pub fn session_overlay(
+    ctx: &egui::Context,
+    s: &mut Session,
+    toolbar_open: bool,
+    fullscreen: bool,
+    hovering_file: bool,
+    actions: &mut Vec<Action>,
+) {
+    let label = s.label.clone();
+    auto_hide_bar(
+        ctx,
+        "toolbar",
+        toolbar_open,
+        &label,
+        |ui, menu_open| {
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                ui.painter().circle_filled(dot.center(), 3.5, OK);
+                ui.add_space(4.0);
+                ui.label(RichText::new(&s.label).strong().color(Color32::WHITE));
+                bar_separator(ui);
+
+                // egui 0.31 returns a menu's contents only on the frame it closes, so
+                // the menu itself reports that it is open.
+                let r = ui.menu_button(format!("{} ▾", display_title(s)), |ui| {
+                    *menu_open = true;
+                    displays_menu(ui, s, actions)
+                });
+                r.response.on_hover_text("被控端的显示器、虚拟显示器和隐私屏");
+
+                let mode = if s.game { "游戏" } else { "办公" };
+                if ui.button(mode).on_hover_text("办公（清晰）/ 游戏（流畅）切换，Ctrl+Alt+Shift+M").clicked() {
+                    actions.push(Action::SetGameMode(!s.game));
+                }
+                let mut grab = input::grabbed();
+                if ui.toggle_value(&mut grab, "键盘").on_hover_text("捕获键盘：Win 键等组合键发给被控端，Ctrl+Alt+Shift+Q").changed() {
+                    actions.push(Action::SetGrab(grab));
+                }
+                let mut fs = fullscreen;
+                if ui.toggle_value(&mut fs, "全屏").on_hover_text("Ctrl+Alt+Shift+F").changed() {
+                    actions.push(Action::Hotkey(Hotkey::ToggleFullscreen));
+                }
+                let r = ui.menu_button("⋯", |ui| {
+                    *menu_open = true;
+                    more_menu(ui, s, actions)
+                });
+                r.response.on_hover_text("更多");
+                bar_separator(ui);
+                if ui.button(RichText::new("断开").color(DANGER)).on_hover_text("Ctrl+Alt+Shift+X").clicked() {
+                    actions.push(Action::Disconnect);
+                }
+            });
+        },
+    );
 
     if !s.status.is_empty() {
         egui::Area::new(egui::Id::new("status"))
@@ -601,5 +620,123 @@ fn usb_window(ctx: &egui::Context, s: &Session, actions: &mut Vec<Action>) {
     });
     if !open {
         actions.push(Action::ToggleUsb);
+    }
+}
+
+#[cfg(test)]
+mod bar_tests {
+    //! The auto-hiding bar, driven headlessly with simulated pointer input.
+
+    use super::*;
+    use std::cell::Cell;
+
+    struct Sim {
+        ctx: egui::Context,
+        time: f64,
+        pos: egui::Pos2,
+        /// What the last frame drew.
+        bar: Cell<bool>,
+        menu: Cell<bool>,
+        button: Cell<Option<egui::Rect>>,
+        menu_rect: Cell<Option<egui::Rect>>,
+    }
+
+    impl Sim {
+        fn new() -> Self {
+            Self {
+                ctx: egui::Context::default(),
+                time: 0.0,
+                pos: egui::pos2(500.0, 300.0),
+                bar: Cell::new(false),
+                menu: Cell::new(false),
+                button: Cell::new(None),
+                menu_rect: Cell::new(None),
+            }
+        }
+
+        fn frame(&mut self, dt: f64, events: Vec<egui::Event>) {
+            self.time += dt;
+            let mut all = vec![egui::Event::PointerMoved(self.pos)];
+            all.extend(events);
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 700.0))),
+                time: Some(self.time),
+                events: all,
+                ..Default::default()
+            };
+            self.bar.set(false);
+            self.menu.set(false);
+            let _ = self.ctx.run(input, |ctx| {
+                auto_hide_bar(ctx, "toolbar", false, "host", |ui, menu_open| {
+                    self.bar.set(true);
+                    ui.horizontal(|ui| {
+                        ui.label("host");
+                        let r = ui.menu_button("屏幕 1 ▾", |ui| {
+                            *menu_open = true;
+                            self.menu.set(true);
+                            for i in 0..6 {
+                                let _ = ui.button(format!("item {i}"));
+                            }
+                            self.menu_rect.set(Some(ui.min_rect()));
+                        });
+                        self.button.set(Some(r.response.rect));
+                    });
+                });
+            });
+        }
+
+        fn move_to(&mut self, p: egui::Pos2) {
+            self.pos = p;
+            self.frame(0.016, vec![]);
+        }
+
+        fn click(&mut self) {
+            let pos = self.pos;
+            let press = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+            self.frame(0.016, vec![press(true)]);
+            self.frame(0.05, vec![press(false)]);
+        }
+
+        fn wait(&mut self, secs: f64) {
+            for _ in 0..(secs / 0.1) as usize {
+                self.frame(0.1, vec![]);
+            }
+        }
+    }
+
+    #[test]
+    fn stays_while_its_menu_is_open() {
+        let mut s = Sim::new();
+        s.frame(0.0, vec![]);
+        s.wait(1.5);
+        assert!(!s.bar.get(), "hidden at first");
+        s.move_to(egui::pos2(500.0, 2.0));
+        s.move_to(egui::pos2(500.0, 2.0));
+        assert!(s.bar.get(), "shown at the top edge");
+        let b = s.button.get().unwrap();
+        s.move_to(b.center());
+        s.click();
+        assert!(s.menu.get(), "menu opened");
+        // Down into the menu, well below the bar, and linger there.
+        let m = s.menu_rect.get().unwrap();
+        s.move_to(egui::pos2(m.center().x, m.bottom() - 5.0));
+        s.wait(3.0);
+        assert!(s.bar.get() && s.menu.get(), "bar and menu stay while the menu is open");
+        // Close the menu by clicking elsewhere; the bar hides after the delay.
+        s.move_to(egui::pos2(900.0, 650.0));
+        s.click();
+        s.wait(2.0);
+        assert!(!s.menu.get() && !s.bar.get(), "hidden again after the menu closed");
+    }
+
+    #[test]
+    fn hides_after_the_pointer_leaves() {
+        let mut s = Sim::new();
+        s.move_to(egui::pos2(500.0, 2.0));
+        s.move_to(egui::pos2(500.0, 20.0));
+        assert!(s.bar.get());
+        s.move_to(egui::pos2(500.0, 400.0));
+        s.wait(2.0);
+        assert!(!s.bar.get());
     }
 }
