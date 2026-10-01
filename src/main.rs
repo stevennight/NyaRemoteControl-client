@@ -16,6 +16,7 @@ mod events;
 mod input;
 mod mic;
 mod net;
+mod printing;
 mod render;
 mod session;
 mod stats;

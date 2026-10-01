@@ -1281,6 +1281,16 @@ impl ApplicationHandler<UiEvent> for App {
                     s.on_usb_status(st);
                 }
             }
+            UiEvent::PrintJob(path) => {
+                let mode = self.sd.print_mode.clone();
+                let ui = self.ui_tx.for_conn(self.conn_id);
+                std::thread::spawn(move || ui.send(UiEvent::PrintDone(crate::printing::handle(&path, &mode))));
+            }
+            UiEvent::PrintDone(msg) => {
+                if let Some(s) = &mut self.session {
+                    s.notice(msg, Duration::from_secs(10));
+                }
+            }
             UiEvent::FolderMount(st) => {
                 if let Some(s) = &mut self.session {
                     let msg = if st.mounted {

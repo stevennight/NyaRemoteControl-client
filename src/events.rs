@@ -85,6 +85,10 @@ pub enum UiEvent {
     UsbStatus(pb::UsbStatus),
     /// What became of our shared folders on the host.
     FolderMount(pb::FolderMountStatus),
+    /// A print job from the host, saved here.
+    PrintJob(std::path::PathBuf),
+    /// How a print job went (shown in the session window).
+    PrintDone(String),
     /// (usbipd installed, devices).
     UsbDevices(bool, Result<Vec<crate::usb::UsbDevice>, String>),
     /// usbipd-win install progress: (still running, message)

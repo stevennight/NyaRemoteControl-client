@@ -259,7 +259,7 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
         sinks.ui.clone(),
         sinks.stats.clone(),
         sinks.clip.clone(),
-        (files_on, images_on, clip_on),
+        (files_on, images_on, clip_on, neg.has(Feature::Print)),
         neg.has(Feature::MultiStream),
     ));
     // Control messages from spawned tasks (failed clipboard sends).
@@ -452,7 +452,7 @@ async fn accept_uni(
     ui: Ui,
     stats: Arc<Shared>,
     clip: Arc<crate::transfer::ClipFiles>,
-    flags: (bool, bool, bool),
+    flags: (bool, bool, bool, bool),
     multi: bool,
 ) {
     let downloads = Arc::new(crate::transfer::Downloads::default());

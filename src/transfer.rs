@@ -199,7 +199,13 @@ pub struct Downloads {
 }
 
 /// A FILE stream from the host (after the type varint).
-pub async fn receive(mut r: RecvStream, ui: Ui, downloads: Arc<Downloads>, clip: Arc<ClipFiles>, (files_on, images_on, clip_on): (bool, bool, bool)) {
+pub async fn receive(
+    mut r: RecvStream,
+    ui: Ui,
+    downloads: Arc<Downloads>,
+    clip: Arc<ClipFiles>,
+    (files_on, images_on, clip_on, print_on): (bool, bool, bool, bool),
+) {
     let h = match files::read_header(&mut r).await {
         Ok(h) => h,
         Err(e) => return tracing::warn!("file header: {e:#}"),
@@ -230,6 +236,16 @@ pub async fn receive(mut r: RecvStream, ui: Ui, downloads: Arc<Downloads>, clip:
                     Err(e) => prog.finish(Err(e.clone()), None),
                 }
                 clip.finish(id, done);
+            }
+        }
+        pb::FilePurpose::Print if print_on => {
+            let dir = nya_win::shell::receive_dir(None).unwrap_or_else(|| std::env::temp_dir().join("NyaRemoteControl")).join("打印");
+            match files::receive_to_dir(&mut r, &h, &dir, |_| {}).await {
+                Ok(p) => {
+                    tracing::info!("print job from the host: {}", p.display());
+                    ui.send(UiEvent::PrintJob(p));
+                }
+                Err(e) => tracing::warn!("receiving print job {}: {e:#}", h.name),
             }
         }
         pb::FilePurpose::Save if files_on => {
