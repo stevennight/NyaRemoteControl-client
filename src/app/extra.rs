@@ -170,7 +170,7 @@ impl App {
                 self.open_requests.push(d.id);
             }
         }
-        if !self.cfg.defaults.multi_window || !s.multi_supported {
+        if !self.sd.multi_window || !s.multi_supported {
             return;
         }
         let main = s.stream.as_ref().map(|x| x.display_id);

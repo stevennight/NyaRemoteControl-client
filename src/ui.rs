@@ -34,6 +34,18 @@ pub enum Action {
     OpenFolder(std::path::PathBuf),
 }
 
+/// The settings key of a policy (inverse of `parse_policy`).
+pub fn policy_key(p: nya_proto::pb::BitratePolicy) -> &'static str {
+    use nya_proto::pb::BitratePolicy as P;
+    match p {
+        P::Quality => "quality",
+        P::Balanced => "balanced",
+        P::Smooth => "smooth",
+        P::Fixed => "fixed",
+        P::Unspecified => "auto",
+    }
+}
+
 pub fn parse_policy(s: &str) -> nya_proto::pb::BitratePolicy {
     use nya_proto::pb::BitratePolicy as P;
     match s {

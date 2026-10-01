@@ -8,7 +8,7 @@ pub fn data_dir() -> PathBuf {
     base.join("NyaRemoteControl").join("client")
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HostEntry {
     pub name: String,
     pub address: String,
@@ -18,6 +18,20 @@ pub struct HostEntry {
     /// Unix seconds of the last successful connection (0 = never).
     #[serde(default)]
     pub last_connected: u64,
+    /// The name the host gave itself at the last connection.
+    #[serde(default)]
+    pub server_name: String,
+    /// Named here: keep `name` instead of following `server_name`. Entries
+    /// from before this field may have been renamed, so they keep theirs.
+    #[serde(default = "yes")]
+    pub custom_name: bool,
+    /// Connection settings for this host; `None` = the defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<Defaults>,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +74,10 @@ pub struct Defaults {
     pub vd_scale: bool,
     /// Open every host display in its own window (otherwise one window, switch between them).
     pub multi_window: bool,
+    /// Send this computer's microphone to the host after connecting.
+    pub mic: bool,
+    /// Capture the keyboard (Win key combinations go to the host) after connecting.
+    pub grab_keyboard: bool,
 }
 
 impl Default for Defaults {
@@ -86,12 +104,57 @@ impl Default for Defaults {
             vd_height: 1080,
             vd_scale: true,
             multi_window: false,
+            mic: false,
+            grab_keyboard: false,
+        }
+    }
+}
+
+/// Command-line overrides for one connection (`nya-client connect … --mode game`).
+#[derive(Debug, Clone, Default)]
+pub struct Overrides {
+    pub mode: Option<String>,
+    pub display: Option<u32>,
+    pub fullscreen: bool,
+    pub encoder: Option<String>,
+    pub codec: Option<String>,
+    pub chroma: Option<String>,
+    pub bitrate_kbps: Option<u32>,
+    pub sw_decode: bool,
+}
+
+impl Overrides {
+    pub fn apply(&self, d: &mut Defaults) {
+        if let Some(m) = &self.mode {
+            d.mode = m.clone();
+        }
+        if let Some(x) = self.display {
+            d.display = x;
+        }
+        d.fullscreen |= self.fullscreen;
+        if let Some(x) = &self.encoder {
+            d.encoder = x.clone();
+        }
+        if let Some(x) = &self.codec {
+            d.codec = x.clone();
+        }
+        if let Some(x) = &self.chroma {
+            d.chroma = x.clone();
+        }
+        if let Some(x) = self.bitrate_kbps {
+            d.bitrate_kbps = x;
+        }
+        if self.sw_decode {
+            d.hw_decode = false;
         }
     }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClientConfig {
+    /// This computer's name as hosts show it; empty = the computer name.
+    #[serde(default)]
+    pub client_name: String,
     #[serde(default)]
     pub defaults: Defaults,
     #[serde(default)]
@@ -121,42 +184,88 @@ impl ClientConfig {
         self.hosts.iter().find(|h| h.name == key || h.address == key)
     }
 
-    /// Rename host `i`. Names are how hosts are picked on the command line, so
-    /// they must stay non-empty and unique.
+    /// The settings to connect to `address` with.
+    pub fn settings_for(&self, address: &str) -> Defaults {
+        self.hosts.iter().find(|h| h.address == address).and_then(|h| h.settings.clone()).unwrap_or_else(|| self.defaults.clone())
+    }
+
+    /// Change the settings of a saved host (starting from the defaults).
+    pub fn edit_settings(&mut self, address: &str, f: impl FnOnce(&mut Defaults)) -> bool {
+        let defaults = &self.defaults;
+        let Some(h) = self.hosts.iter_mut().find(|h| h.address == address) else { return false };
+        f(h.settings.get_or_insert_with(|| defaults.clone()));
+        true
+    }
+
+    /// `base`, or `base (2)` … so that no host other than `except` has it.
+    fn unique_name(&self, base: &str, except: Option<usize>) -> String {
+        let taken = |n: &str| self.hosts.iter().enumerate().any(|(j, h)| Some(j) != except && (h.name == n || h.address == n));
+        let mut name = base.to_owned();
+        let mut n = 2;
+        while taken(&name) {
+            name = format!("{base} ({n})");
+            n += 1;
+        }
+        name
+    }
+
+    /// What host `i` is called when it is not named here.
+    fn automatic_name(&self, i: usize) -> String {
+        let h = &self.hosts[i];
+        let base = if h.server_name.trim().is_empty() { h.address.clone() } else { h.server_name.trim().to_owned() };
+        self.unique_name(&base, Some(i))
+    }
+
+    /// Rename host `i`; an empty name goes back to the name the host gives
+    /// itself. Names are how hosts are picked on the command line, so they
+    /// must stay unique.
     pub fn rename(&mut self, i: usize, name: &str) -> Result<(), &'static str> {
+        if i >= self.hosts.len() {
+            return Err("被控端不存在");
+        }
         let name = name.trim();
         if name.is_empty() {
-            return Err("名称不能为空");
+            self.hosts[i].name = self.automatic_name(i);
+            self.hosts[i].custom_name = false;
+            return Ok(());
         }
         if self.hosts.iter().enumerate().any(|(j, h)| j != i && (h.name == name || h.address == name)) {
             return Err("已有同名的被控端");
         }
-        let h = self.hosts.get_mut(i).ok_or("被控端不存在")?;
+        let h = &mut self.hosts[i];
         h.name = name.to_owned();
+        h.custom_name = true;
         Ok(())
     }
 
-    /// Save a host after connecting. Matched by address; a name that another
-    /// host already uses gets a number appended instead of replacing it.
-    pub fn upsert(&mut self, mut entry: HostEntry) {
-        if let Some(i) = self.hosts.iter().position(|h| h.address == entry.address) {
-            let name_free = !entry.name.trim().is_empty() && !self.hosts.iter().any(|o| o.name == entry.name.trim());
-            let h = &mut self.hosts[i];
-            h.fingerprint = entry.fingerprint;
-            h.last_connected = entry.last_connected.max(h.last_connected);
-            if name_free {
-                h.name = entry.name.trim().to_owned();
+    /// Save a host added by hand; an empty name follows the host's own name
+    /// once connected.
+    pub fn add(&mut self, address: &str, name: &str) {
+        let custom = !name.trim().is_empty();
+        let base = if custom { name.trim() } else { address };
+        let name = self.unique_name(base, None);
+        self.hosts.push(HostEntry { name, address: address.to_owned(), custom_name: custom, ..Default::default() });
+    }
+
+    /// Record a successful connection: matched by address, added if new.
+    /// Unless named here, the host is shown under the name it gives itself.
+    /// Returns the host's name.
+    pub fn connected(&mut self, address: &str, server_name: &str, fingerprint: String, now: u64) -> String {
+        let i = match self.hosts.iter().position(|h| h.address == address) {
+            Some(i) => i,
+            None => {
+                self.hosts.push(HostEntry { address: address.to_owned(), custom_name: false, ..Default::default() });
+                self.hosts.len() - 1
             }
-            return;
+        };
+        let h = &mut self.hosts[i];
+        h.fingerprint = fingerprint;
+        h.last_connected = now.max(h.last_connected);
+        h.server_name = server_name.trim().to_owned();
+        if !h.custom_name || h.name.is_empty() {
+            self.hosts[i].name = self.automatic_name(i);
         }
-        let base = if entry.name.trim().is_empty() { entry.address.clone() } else { entry.name.trim().to_owned() };
-        entry.name = base.clone();
-        let mut n = 2;
-        while self.hosts.iter().any(|h| h.name == entry.name) {
-            entry.name = format!("{base} ({n})");
-            n += 1;
-        }
-        self.hosts.push(entry);
+        self.hosts[i].name.clone()
     }
 }
 
@@ -164,22 +273,47 @@ impl ClientConfig {
 mod tests {
     use super::*;
 
-    fn host(name: &str, address: &str) -> HostEntry {
-        HostEntry { name: name.into(), address: address.into(), fingerprint: String::new(), last_connected: 0 }
+    #[test]
+    fn names_follow_the_host_unless_renamed() {
+        let mut c = ClientConfig::default();
+        assert_eq!(c.connected("10.0.0.1", "pc", "aa".into(), 1), "pc");
+        assert_eq!(c.connected("10.0.0.2", "pc", "bb".into(), 1), "pc (2)");
+        // The host renames itself: followed.
+        assert_eq!(c.connected("10.0.0.1", "office-pc", "aa".into(), 2), "office-pc");
+        // Renamed here: kept across connections.
+        c.rename(0, " 公司 ").unwrap();
+        assert_eq!(c.connected("10.0.0.1", "other", "ab".into(), 3), "公司");
+        assert_eq!(c.hosts[0].fingerprint, "ab");
+        assert!(c.rename(0, "pc (2)").is_err());
+        assert!(c.rename(1, "10.0.0.1").is_err());
+        // An empty name goes back to the host's own.
+        c.rename(0, "  ").unwrap();
+        assert_eq!((c.hosts[0].name.as_str(), c.hosts[0].custom_name), ("other", false));
+        // Added by hand without a name: shows the address until connected.
+        c.add("10.0.0.3", "");
+        assert_eq!(c.hosts[2].name, "10.0.0.3");
+        assert_eq!(c.connected("10.0.0.3", "nas", "cc".into(), 4), "nas");
+        c.add("10.0.0.4", "家里");
+        assert_eq!(c.connected("10.0.0.4", "nas", "dd".into(), 4), "家里");
     }
 
     #[test]
-    fn upsert_and_rename() {
+    fn per_host_settings() {
         let mut c = ClientConfig::default();
-        c.upsert(host("pc", "10.0.0.1"));
-        c.upsert(host("pc", "10.0.0.2"));
-        assert_eq!(c.hosts[1].name, "pc (2)");
-        // Reconnecting keeps a user-chosen name.
-        c.rename(0, " office ").unwrap();
-        c.upsert(HostEntry { fingerprint: "ab".into(), ..host("pc (2)", "10.0.0.1") });
-        assert_eq!((c.hosts[0].name.as_str(), c.hosts[0].fingerprint.as_str()), ("office", "ab"));
-        assert!(c.rename(0, "pc (2)").is_err());
-        assert!(c.rename(0, "  ").is_err());
-        assert!(c.rename(1, "10.0.0.1").is_err());
+        c.connected("10.0.0.1", "pc", "aa".into(), 1);
+        assert!(!c.settings_for("10.0.0.1").mic);
+        c.defaults.mic = true;
+        assert!(c.settings_for("10.0.0.1").mic, "no own settings: the defaults");
+        assert!(c.edit_settings("10.0.0.1", |d| d.mode = "game".into()));
+        let d = c.settings_for("10.0.0.1");
+        assert_eq!((d.mode.as_str(), d.mic), ("game", true), "own settings start from the defaults");
+        assert_eq!(c.settings_for("10.0.0.9").mode, "office");
+        assert!(!c.edit_settings("10.0.0.9", |_| {}));
+    }
+
+    #[test]
+    fn old_entries_keep_their_names() {
+        let c: ClientConfig = toml::from_str("[[hosts]]\nname = \"公司\"\naddress = \"10.0.0.1\"\n").unwrap();
+        assert!(c.hosts[0].custom_name && c.hosts[0].settings.is_none());
     }
 }

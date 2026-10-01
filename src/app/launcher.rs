@@ -7,7 +7,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use super::{App, Pending};
-use crate::config::{Defaults, HostEntry};
+use crate::config::Defaults;
 use crate::events::UiEvent;
 
 /// Where a connection attempt started from the launcher is (drives its dialogs).
@@ -39,6 +39,11 @@ struct HostJs<'a> {
     address: &'a str,
     paired: bool,
     last_connected: u64,
+    /// The name the host gives itself (empty until connected).
+    server_name: &'a str,
+    custom_name: bool,
+    /// Own connection settings; `None` = the defaults.
+    settings: Option<&'a Defaults>,
 }
 
 #[derive(Clone, Copy)]
@@ -80,11 +85,21 @@ impl App {
             .cfg
             .hosts
             .iter()
-            .map(|h| HostJs { name: &h.name, address: &h.address, paired: !h.fingerprint.is_empty(), last_connected: h.last_connected })
+            .map(|h| HostJs {
+                name: &h.name,
+                address: &h.address,
+                paired: !h.fingerprint.is_empty(),
+                last_connected: h.last_connected,
+                server_name: &h.server_name,
+                custom_name: h.custom_name,
+                settings: h.settings.as_ref(),
+            })
             .collect();
         json!({
             "version": env!("CARGO_PKG_VERSION"),
-            "computer": self.client_name,
+            "computer": self.client_name(),
+            "client_name": self.cfg.client_name,
+            "computer_name": std::env::var("COMPUTERNAME").unwrap_or_default(),
             "decode": self.decode_summary,
             "hosts": hosts,
             "defaults": self.cfg.defaults,
@@ -151,7 +166,7 @@ impl App {
                 if address.is_empty() {
                     return Err("请输入地址".to_string());
                 }
-                self.connect(address, a.name.filter(|n| !n.trim().is_empty()));
+                self.connect(address, a.name.filter(|n| !n.trim().is_empty()), None);
                 Ok(Value::Null)
             })(),
             "cancel_connect" => {
@@ -204,8 +219,7 @@ impl App {
                 if self.cfg.hosts.iter().any(|h| h.address == address) {
                     return Err("这个地址已经保存过了".to_string());
                 }
-                let name = a.name.unwrap_or_default();
-                self.cfg.upsert(HostEntry { name, address, fingerprint: String::new(), last_connected: 0 });
+                self.cfg.add(&address, &a.name.unwrap_or_default());
                 self.save_cfg()
             })(),
             "rename_host" => (|| {
@@ -219,9 +233,30 @@ impl App {
                 self.cfg.hosts.retain(|h| h.address != a.address);
                 self.save_cfg()
             })(),
+            // With `address`: that host's own settings; otherwise the defaults.
             "save_defaults" => (|| {
                 let d: Defaults = serde_json::from_value(c.args.get("defaults").cloned().unwrap_or_default()).map_err(|e| format!("设置格式不对：{e}"))?;
-                self.cfg.defaults = d;
+                match c.args.get("address").and_then(Value::as_str) {
+                    Some(address) => {
+                        let h = self.cfg.hosts.iter_mut().find(|h| h.address == address).ok_or("设备不存在")?;
+                        h.settings = Some(d);
+                    }
+                    None => self.cfg.defaults = d,
+                }
+                self.save_cfg()
+            })(),
+            "reset_host_settings" => (|| {
+                let a = args(&c)?;
+                let h = self.cfg.hosts.iter_mut().find(|h| h.address == a.address).ok_or("设备不存在")?;
+                h.settings = None;
+                self.save_cfg()
+            })(),
+            "set_client_name" => (|| {
+                let name = c.args.get("name").and_then(Value::as_str).unwrap_or_default().trim().to_owned();
+                if name.chars().count() > 64 {
+                    return Err("名称太长".to_string());
+                }
+                self.cfg.client_name = name;
                 self.save_cfg()
             })(),
             "diag" => {

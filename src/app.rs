@@ -18,7 +18,7 @@ use winit::platform::windows::MonitorHandleExtWindows;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{CursorGrabMode, CursorIcon, CustomCursor, Fullscreen, Window, WindowId};
 
-use crate::config::{ClientConfig, Defaults, HostEntry};
+use crate::config::{ClientConfig, Defaults};
 use crate::events::{ConnectDone, Hotkey, Ui, UiEvent};
 use crate::net::{self, Link, PairPrompt, Params};
 use crate::render::{fit, Renderer};
@@ -34,6 +34,10 @@ use crate::{caps, input};
 struct Pending {
     address: String,
     label: Option<String>,
+    /// Name given with the address (command line), for a host not saved yet.
+    name: Option<String>,
+    /// Command-line settings for this connection only.
+    overrides: Option<crate::config::Overrides>,
     reverify: bool,
 }
 
@@ -43,8 +47,11 @@ pub struct App {
     data_dir: PathBuf,
     cfg: ClientConfig,
     identity: Identity,
-    client_name: String,
-    auto_connect: Option<(String, Option<String>)>,
+    auto_connect: Option<(String, Option<String>, crate::config::Overrides)>,
+    /// Settings of the running session (the host's, with command-line
+    /// overrides), and the host's address to save changes under.
+    sd: Defaults,
+    session_host: String,
 
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
@@ -161,7 +168,7 @@ impl App {
         data_dir: PathBuf,
         cfg: ClientConfig,
         identity: Identity,
-        auto_connect: Option<(String, Option<String>)>,
+        auto_connect: Option<(String, Option<String>, crate::config::Overrides)>,
     ) -> Self {
         Self {
             rt,
@@ -169,8 +176,9 @@ impl App {
             data_dir,
             cfg,
             identity,
-            client_name: std::env::var("COMPUTERNAME").unwrap_or_else(|_| "nya-client".into()),
             auto_connect,
+            sd: Defaults::default(),
+            session_host: String::new(),
             window: None,
             renderer: None,
             gui: None,
@@ -252,7 +260,7 @@ impl App {
             return None;
         }
         let main = self.window.as_ref()?;
-        let follow = !matches!(self.cfg.defaults.vd_size.as_str(), "fixed" | "screen");
+        let follow = !matches!(self.sd.vd_size.as_str(), "fixed" | "screen");
         let displays = self.session.as_ref().and_then(|s| s.info.as_ref()).map(|i| i.displays.clone()).unwrap_or_default();
         let mut screens = Vec::new();
         for i in 1..=count {
@@ -298,7 +306,7 @@ impl App {
     /// A virtual screen sized for `w` (following the settings); `None` while
     /// the window is minimized.
     fn virtual_screen(&self, w: &Window, fullscreen: bool) -> Option<pb::VirtualScreen> {
-        let d = &self.cfg.defaults;
+        let d = &self.sd;
         if w.is_minimized() == Some(true) || w.inner_size().width == 0 {
             return None;
         }
@@ -331,11 +339,33 @@ impl App {
 
     // --------------------------------------------------------------- connecting
 
-    fn connect(&mut self, target: String, name: Option<String>) {
+    fn connect(&mut self, target: String, name: Option<String>, overrides: Option<crate::config::Overrides>) {
         let entry = self.cfg.find(&target).cloned();
         let address = entry.as_ref().map(|e| e.address.clone()).unwrap_or(target);
-        let label = name.or_else(|| entry.as_ref().map(|e| e.name.clone()));
-        self.start_connect(Pending { address, label, reverify: false });
+        let name = name.filter(|n| !n.trim().is_empty() && entry.is_none());
+        let label = entry.as_ref().map(|e| e.name.clone()).or_else(|| name.clone());
+        self.start_connect(Pending { address, label, name, overrides, reverify: false });
+    }
+
+    /// This computer's name as hosts show it.
+    pub(super) fn client_name(&self) -> String {
+        let n = self.cfg.client_name.trim();
+        if n.is_empty() {
+            std::env::var("COMPUTERNAME").unwrap_or_else(|_| "nya-client".into())
+        } else {
+            n.to_owned()
+        }
+    }
+
+    /// A setting changed during the session: keep it for this host.
+    fn remember(&mut self, f: impl Fn(&mut Defaults)) {
+        f(&mut self.sd);
+        if self.cfg.edit_settings(&self.session_host, f) {
+            if let Err(e) = self.cfg.save(&self.data_dir) {
+                tracing::warn!("save config: {e:#}");
+            }
+            self.push_state();
+        }
     }
 
     fn start_connect(&mut self, p: Pending) {
@@ -350,7 +380,7 @@ impl App {
         };
         self.attempt += 1;
         let attempt = self.attempt;
-        let (id, name, ui, address) = (self.identity.clone(), self.client_name.clone(), self.ui_tx.clone(), p.address.clone());
+        let (id, name, ui, address) = (self.identity.clone(), self.client_name(), self.ui_tx.clone(), p.address.clone());
         let ui2 = ui.clone();
         let prompt: PairPrompt = Arc::new(move || {
             let (tx, rx) = std::sync::mpsc::channel();
@@ -422,15 +452,27 @@ impl App {
 
     fn finish_connect(&mut self, link: Box<Link>) {
         let Some(p) = self.pending.take() else { return };
-        let label = p.label.unwrap_or_else(|| link.welcome.server_name.clone());
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-        self.cfg.upsert(HostEntry { name: label.clone(), address: p.address, fingerprint: link.server_fp.to_hex(), last_connected: now });
+        let new_host = !self.cfg.hosts.iter().any(|h| h.address == p.address);
+        let mut label = self.cfg.connected(&p.address, &link.welcome.server_name, link.server_fp.to_hex(), now);
+        if let (true, Some(name)) = (new_host, &p.name) {
+            if let Some(i) = self.cfg.hosts.iter().position(|h| h.address == p.address) {
+                if self.cfg.rename(i, name).is_ok() {
+                    label = self.cfg.hosts[i].name.clone();
+                }
+            }
+        }
         if let Err(e) = self.cfg.save(&self.data_dir) {
             tracing::warn!("save config: {e:#}");
         }
         self.push_state();
         let Some(dev) = self.renderer.as_ref().map(|r| r.dev.clone()) else { return };
-        let d = self.cfg.defaults.clone();
+        let mut d = self.cfg.settings_for(&p.address);
+        if let Some(o) = &p.overrides {
+            o.apply(&mut d);
+        }
+        self.sd = d.clone();
+        self.session_host = p.address.clone();
         let monitor_fps = self
             .window
             .as_ref()
@@ -447,7 +489,7 @@ impl App {
             addr: link.conn.remote_address(),
             pinned: link.server_fp,
             identity: self.identity.clone(),
-            name: self.client_name.clone(),
+            name: self.client_name(),
             caps,
             start: start_request(&d, vd),
             extra: Default::default(),
@@ -463,6 +505,10 @@ impl App {
         if d.fullscreen {
             self.set_fullscreen(true);
         }
+        if let Some(s) = &mut self.session {
+            s.mic_auto = d.mic;
+        }
+        self.set_grab(d.grab_keyboard);
         self.update_no_hotkeys();
         self.update_title();
     }
@@ -543,7 +589,11 @@ impl App {
             return;
         }
         match h {
-            Hotkey::ToggleGrab => self.set_grab(!input::grabbed()),
+            Hotkey::ToggleGrab => {
+                let on = !input::grabbed();
+                self.set_grab(on);
+                self.remember(|d| d.grab_keyboard = on);
+            }
             Hotkey::ToggleStats => {
                 if let Some(s) = &mut self.session {
                     s.show_stats = !s.show_stats;
@@ -553,6 +603,7 @@ impl App {
                 if let Some(s) = &mut self.session {
                     let g = !s.game;
                     s.set_game_mode(g);
+                    self.remember(|d| d.mode = if g { "game" } else { "office" }.into());
                 }
             }
             Hotkey::ToggleRelative => {
@@ -596,6 +647,7 @@ impl App {
                     if let Some(s) = &mut self.session {
                         s.set_game_mode(g);
                     }
+                    self.remember(|d| d.mode = if g { "game" } else { "office" }.into());
                 }
                 Action::OpenWindow(display_id) => self.open_requests.push(display_id),
                 Action::NewVirtualWindow => self.new_virtual_window(),
@@ -604,13 +656,21 @@ impl App {
                     if let Some(s) = &mut self.session {
                         s.set_display_setup(setup);
                     }
+                    self.remember(|d| {
+                        d.vd_count = choice.count;
+                        d.physical_off = choice.physical_off;
+                        d.block_input = choice.block_input;
+                    });
                 }
                 Action::SelectDisplay(id) => {
                     if let Some(s) = &mut self.session {
                         s.select_display(id);
                     }
                 }
-                Action::SetGrab(on) => self.set_grab(on),
+                Action::SetGrab(on) => {
+                    self.set_grab(on);
+                    self.remember(|d| d.grab_keyboard = on);
+                }
                 Action::ToggleUsb => {
                     let open = self.session.as_ref().is_some_and(|s| !s.usb_open);
                     if let Some(s) = &mut self.session {
@@ -669,11 +729,13 @@ impl App {
                     if let Some(s) = &mut self.session {
                         s.set_mic(on);
                     }
+                    self.remember(|d| d.mic = on);
                 }
                 Action::SetPolicy(p) => {
                     if let Some(s) = &mut self.session {
                         s.set_bitrate_policy(p);
                     }
+                    self.remember(|d| d.bitrate_policy = crate::ui::policy_key(p).into());
                 }
                 Action::Disconnect => self.end_session(Some((Kind::Info, "已断开连接".into()))),
                 Action::PickFiles => {
@@ -1005,8 +1067,8 @@ impl ApplicationHandler<UiEvent> for App {
         self.create_web();
         let ui = self.ui_tx.clone();
         std::thread::spawn(move || ui.send(UiEvent::DecodeSummary(crate::diag::decode_summary())));
-        if let Some((target, name)) = self.auto_connect.take() {
-            self.connect(target, name);
+        if let Some((target, name, overrides)) = self.auto_connect.take() {
+            self.connect(target, name, Some(overrides));
         }
         self.draw();
     }

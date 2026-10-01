@@ -103,6 +103,8 @@ pub struct Session {
     pub status_until: Option<Instant>,
     /// The host speaks FEATURE_VIRTUAL_DISPLAY.
     pub vd_supported: bool,
+    /// Turn the microphone on once the host says it can take it.
+    pub mic_auto: bool,
     /// Virtual display follows the window size.
     pub vd_follow_window: bool,
     pub info: Option<pb::SessionInfo>,
@@ -201,6 +203,7 @@ impl Session {
             status: "连接中".into(),
             status_until: None,
             vd_supported: false,
+            mic_auto: false,
             vd_follow_window: false,
             info: None,
             stream: None,
@@ -428,6 +431,10 @@ impl Session {
             self.gamepads = None;
         }
         self.info = Some(info);
+        if self.mic_auto && self.host_mic_device().is_some() {
+            self.mic_auto = false;
+            self.set_mic(true);
+        }
     }
 
     pub fn usb_available(&self) -> bool {

@@ -155,31 +155,9 @@ fn real_main() -> Result<()> {
             return Ok(());
         }
         Some(Cmd::Connect { target, name, mode, display, fullscreen, encoder, codec, chroma, bitrate, sw_decode }) => {
-            // Command-line overrides apply to this run only (until "保存设置").
-            let d = &mut cfg.defaults;
-            if let Some(m) = mode {
-                d.mode = m;
-            }
-            if let Some(x) = display {
-                d.display = x;
-            }
-            d.fullscreen |= fullscreen;
-            if let Some(x) = encoder {
-                d.encoder = x;
-            }
-            if let Some(x) = codec {
-                d.codec = x;
-            }
-            if let Some(x) = chroma {
-                d.chroma = x;
-            }
-            if let Some(x) = bitrate {
-                d.bitrate_kbps = x;
-            }
-            if sw_decode {
-                d.hw_decode = false;
-            }
-            Some((target, name))
+            // Command-line overrides apply to this connection only.
+            let o = config::Overrides { mode, display, fullscreen, encoder, codec, chroma, bitrate_kbps: bitrate, sw_decode };
+            Some((target, name, o))
         }
         None => None,
     };
