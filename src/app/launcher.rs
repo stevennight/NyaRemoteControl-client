@@ -54,7 +54,7 @@ pub enum Kind {
 
 impl App {
     pub(super) fn create_web(&mut self) {
-        let Some(window) = self.window.clone() else { return };
+        let Some(window) = self.launcher.clone() else { return };
         let ui = self.ui_tx.clone();
         let dark = matches!(window.theme(), Some(winit::window::Theme::Dark));
         let opts = nya_webui::Options {
@@ -68,15 +68,45 @@ impl App {
         }
     }
 
-    /// The page is shown whenever no session runs.
-    pub(super) fn show_web(&self, visible: bool) {
-        if let Some(w) = &self.web {
-            w.set_visible(visible);
-        }
-        if !visible {
-            if let Some(win) = &self.window {
+    /// Show the session window (session started) or hide it and bring the
+    /// launcher back (session ended).
+    pub(super) fn show_session_window(&self, on: bool) {
+        if let Some(win) = &self.window {
+            win.set_visible(on);
+            if on {
                 win.focus_window();
             }
+        }
+        if !on {
+            if let Some(l) = &self.launcher {
+                l.set_visible(true);
+                l.set_minimized(false);
+                l.focus_window();
+            }
+        }
+    }
+
+    /// Events of the launcher window (the page handles its own input).
+    pub(super) fn launcher_event(&mut self, el: &winit::event_loop::ActiveEventLoop, event: winit::event::WindowEvent) {
+        use winit::event::WindowEvent;
+        match event {
+            WindowEvent::Resized(size) => {
+                if let Some(w) = &self.web {
+                    w.resize(size);
+                }
+            }
+            WindowEvent::CloseRequested if self.session.is_some() => {
+                // The session goes on in its own window; keep the launcher reachable.
+                if let Some(l) = &self.launcher {
+                    l.set_minimized(true);
+                }
+            }
+            WindowEvent::CloseRequested => {
+                self.cancel_connect();
+                self.exit = true;
+                el.exit();
+            }
+            _ => {}
         }
     }
 
@@ -159,7 +189,10 @@ impl App {
             "state" => Ok(self.web_state()),
             "connect" => (|| {
                 let a = args(&c)?;
-                if self.pending.is_some() || self.session.is_some() {
+                if self.session.is_some() {
+                    return Err("已经有一个远程会话，请先在远程窗口里断开".to_string());
+                }
+                if self.pending.is_some() {
                     return Err("正在连接中".to_string());
                 }
                 let address = a.address.trim().to_owned();

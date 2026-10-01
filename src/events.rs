@@ -81,7 +81,8 @@ pub enum UiEvent {
     FileResult(pb::FileResult),
     Transfer(TransferUpdate),
     UsbStatus(pb::UsbStatus),
-    UsbDevices(Result<Vec<crate::usb::UsbDevice>, String>),
+    /// (usbipd installed, devices).
+    UsbDevices(bool, Result<Vec<crate::usb::UsbDevice>, String>),
     /// usbipd-win install progress: (still running, message)
     UsbipdInstall(bool, String),
     /// Clipboard image from the host.

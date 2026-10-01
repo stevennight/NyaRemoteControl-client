@@ -51,13 +51,14 @@ pub struct UsbDevice {
     pub in_use: bool,
 }
 
+/// Runs `where` when usbipd is not in its usual place: call it off the UI thread.
 pub fn usbipd_exe() -> Option<PathBuf> {
     let pf = std::env::var_os("ProgramFiles").map(PathBuf::from)?;
     let p = pf.join("usbipd-win").join("usbipd.exe");
     if p.exists() {
         return Some(p);
     }
-    let out = Command::new("where").arg("usbipd").output().ok()?;
+    let out = no_window(&mut Command::new("where")).arg("usbipd").output().ok()?;
     String::from_utf8_lossy(&out.stdout).lines().next().map(|l| PathBuf::from(l.trim())).filter(|p| p.exists())
 }
 

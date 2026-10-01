@@ -559,7 +559,14 @@ fn transfers_panel(ctx: &egui::Context, s: &Session, actions: &mut Vec<Action>) 
 fn usb_window(ctx: &egui::Context, s: &Session, actions: &mut Vec<Action>) {
     let mut open = true;
     egui::Window::new("USB 设备透传").open(&mut open).default_pos([60.0, 80.0]).default_width(460.0).show(ctx, |ui| {
-        if crate::usb::usbipd_exe().is_none() {
+        if s.usbipd_present.is_none() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("正在检查本机的 usbipd-win…");
+            });
+            return;
+        }
+        if s.usbipd_present == Some(false) {
             ui.label("需要在本机安装 usbipd-win（可选组件，开源免费）。");
             let running = s.usbipd_install.as_ref().is_some_and(|i| i.0);
             ui.horizontal(|ui| {

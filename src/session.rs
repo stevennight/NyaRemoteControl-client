@@ -90,6 +90,8 @@ pub struct Session {
     pub gamepads: Option<crate::gamepad::Gamepads>,
     pub usb_open: bool,
     pub usb_devices: Option<Result<Vec<crate::usb::UsbDevice>, String>>,
+    /// usbipd-win installed here; `None` while checking.
+    pub usbipd_present: Option<bool>,
     /// busid -> (attached on the host, last message)
     pub usb_state: HashMap<String, (bool, String)>,
     pub usb_busy: std::collections::HashSet<String>,
@@ -195,6 +197,7 @@ impl Session {
             gamepads: None,
             usb_open: false,
             usb_devices: None,
+            usbipd_present: None,
             usb_state: HashMap::new(),
             usb_busy: Default::default(),
             usbipd_install: None,

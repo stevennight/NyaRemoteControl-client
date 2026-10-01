@@ -53,7 +53,10 @@ pub struct App {
     sd: Defaults,
     session_host: String,
 
+    /// The session window (remote picture); hidden while no session runs.
     window: Option<Arc<Window>>,
+    /// The launcher window (devices, settings), a web page.
+    launcher: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     gui: Option<Gui>,
     adapter_luid: u64,
@@ -180,6 +183,7 @@ impl App {
             sd: Defaults::default(),
             session_host: String::new(),
             window: None,
+            launcher: None,
             renderer: None,
             gui: None,
             adapter_luid: 0,
@@ -501,7 +505,7 @@ impl App {
         self.session = Some(session);
         self.vd_resize_at = None;
         self.toolbar_open = false;
-        self.show_web(false);
+        self.show_session_window(true);
         if d.fullscreen {
             self.set_fullscreen(true);
         }
@@ -525,7 +529,7 @@ impl App {
             w.set_cursor_visible(true);
         }
         self.remote_buttons = 0;
-        self.show_web(true);
+        self.show_session_window(false);
         if let Some((kind, text)) = message {
             self.notice(kind, text);
         }
@@ -843,7 +847,12 @@ impl App {
             s.usb_devices = None;
         }
         let ui = self.ui_tx.clone();
-        std::thread::spawn(move || ui.send(UiEvent::UsbDevices(crate::usb::list().map_err(|e| format!("{e:#}")))));
+        // Looking for usbipd and listing devices start processes: never on the UI thread.
+        std::thread::spawn(move || {
+            let present = crate::usb::usbipd_exe().is_some();
+            let list = if present { crate::usb::list().map_err(|e| format!("{e:#}")) } else { Ok(Vec::new()) };
+            ui.send(UiEvent::UsbDevices(present, list));
+        });
     }
 
     fn map_mouse(&self, x: f64, y: f64) -> Option<(u32, u32)> {
@@ -1034,18 +1043,26 @@ impl ApplicationHandler<UiEvent> for App {
         if self.window.is_some() {
             return;
         }
-        let attrs = Window::default_attributes()
+        // The launcher and the session each get a window, so the launcher
+        // stays usable during a session.
+        let launcher = Window::default_attributes()
             .with_title("NyaRemoteControl")
             .with_inner_size(LogicalSize::new(1100.0, 760.0))
             .with_min_inner_size(LogicalSize::new(640.0, 480.0));
-        let window = match el.create_window(attrs) {
-            Ok(w) => Arc::new(w),
-            Err(e) => {
+        let session = Window::default_attributes()
+            .with_title("NyaRemoteControl")
+            .with_inner_size(LogicalSize::new(1280.0, 800.0))
+            .with_min_inner_size(LogicalSize::new(640.0, 480.0))
+            .with_visible(false);
+        let (launcher, window) = match (el.create_window(launcher), el.create_window(session)) {
+            (Ok(l), Ok(w)) => (Arc::new(l), Arc::new(w)),
+            (Err(e), _) | (_, Err(e)) => {
                 crate::fatal(&format!("无法创建窗口：{e}"));
                 el.exit();
                 return;
             }
         };
+        self.launcher = Some(launcher);
         self.window = Some(window.clone());
         let dev = match device_for_window(&window) {
             Ok(d) => d,
@@ -1075,6 +1092,9 @@ impl ApplicationHandler<UiEvent> for App {
 
     fn window_event(&mut self, el: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         let Some(window) = self.window.clone() else { return };
+        if self.launcher.as_ref().is_some_and(|l| l.id() == id) {
+            return self.launcher_event(el, event);
+        }
         if id != window.id() {
             return self.extra_event(id, event);
         }
@@ -1089,17 +1109,9 @@ impl ApplicationHandler<UiEvent> for App {
             }
         }
         match &event {
-            WindowEvent::CloseRequested => {
-                if let Some(s) = &self.session {
-                    s.quit();
-                }
-                self.exit = true;
-                el.exit();
-            }
+            // Closing the session window disconnects; the launcher stays.
+            WindowEvent::CloseRequested => self.end_session(Some((Kind::Info, "已断开连接".into()))),
             WindowEvent::Resized(size) => {
-                if let Some(w) = &self.web {
-                    w.resize(*size);
-                }
                 if let Some(r) = self.renderer.as_mut() {
                     if let Err(e) = r.resize(size.width, size.height) {
                         tracing::warn!("resize: {e:#}");
@@ -1235,8 +1247,9 @@ impl ApplicationHandler<UiEvent> for App {
                     self.refresh_usb();
                 }
             }
-            UiEvent::UsbDevices(r) => {
+            UiEvent::UsbDevices(present, r) => {
                 if let Some(s) = &mut self.session {
+                    s.usbipd_present = Some(present);
                     s.usb_devices = Some(r);
                 }
             }
