@@ -27,6 +27,7 @@ use crate::ui::{self, Action};
 
 mod conn;
 mod extra;
+mod update;
 mod launcher;
 use launcher::{Kind, Phase};
 use crate::{caps, input};
@@ -49,6 +50,7 @@ pub struct App {
     cfg: ClientConfig,
     identity: Identity,
     auto_connect: Option<(String, Option<String>, crate::config::Overrides)>,
+    updates: update::Updates,
     /// The current connection (see `conn`) and the parked others.
     conn_id: u64,
     next_conn: u64,
@@ -186,6 +188,7 @@ impl App {
             cfg,
             identity,
             auto_connect,
+            updates: update::Updates::new(),
             conn_id: 0,
             next_conn: 0,
             others: Vec::new(),
@@ -1086,6 +1089,9 @@ impl ApplicationHandler<UiEvent> for App {
         self.create_web();
         let ui = self.ui_tx.clone();
         std::thread::spawn(move || ui.send(UiEvent::DecodeSummary(crate::diag::decode_summary())));
+        if self.cfg.check_updates {
+            self.check_update();
+        }
         if let Some((target, name, overrides)) = self.auto_connect.take() {
             self.connect(target, name, Some(overrides));
         }
@@ -1229,6 +1235,9 @@ impl ApplicationHandler<UiEvent> for App {
                 self.decode_summary = s;
                 self.push_state();
             }
+            UiEvent::UpdateChecked(r) => self.on_update_checked(r),
+            UiEvent::UpdateProgress(p) => self.on_update_progress(p),
+            UiEvent::UpdateDownloaded(r) => self.on_update_downloaded(r),
             UiEvent::WebReply(id, r) => {
                 if let Some(w) = &self.web {
                     w.reply(id, r);

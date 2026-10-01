@@ -150,15 +150,24 @@ impl Overrides {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
     /// This computer's name as hosts show it; empty = the computer name.
     #[serde(default)]
     pub client_name: String,
+    /// Look for a new version when starting (installing is the user's choice).
+    #[serde(default = "yes")]
+    pub check_updates: bool,
     #[serde(default)]
     pub defaults: Defaults,
     #[serde(default)]
     pub hosts: Vec<HostEntry>,
+}
+
+impl Default for ClientConfig {
+    fn default() -> Self {
+        Self { client_name: String::new(), check_updates: true, defaults: Defaults::default(), hosts: Vec::new() }
+    }
 }
 
 impl ClientConfig {

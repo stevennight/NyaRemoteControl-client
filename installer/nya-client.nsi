@@ -40,6 +40,7 @@ SetCompressor /SOLID lzma
 !include "LogicLib.nsh"
 !include "x64.nsh"
 !include "WinVer.nsh"
+!include "FileFunc.nsh"
 
 Name "${APP_NAME}"
 OutFile "${OUTFILE}"
@@ -85,6 +86,26 @@ FunctionEnd
 
 !macro EnsureAppClosed UN
 Function ${UN}EnsureAppClosed
+  ; Silent (the client's own update): it is quitting; wait for it, then make sure.
+  ${If} ${Silent}
+    StrCpy $1 0
+    ${Do}
+      nsExec::Exec 'cmd /c tasklist /FI "IMAGENAME eq ${APP_EXE}" /NH | find /I "${APP_EXE}"'
+      Pop $0
+      ${If} $0 != 0
+        ${Break}
+      ${EndIf}
+      ${If} $1 >= 40
+        nsExec::Exec 'taskkill /F /IM ${APP_EXE}'
+        Pop $0
+        Sleep 1000
+        ${Break}
+      ${EndIf}
+      Sleep 500
+      IntOp $1 $1 + 1
+    ${Loop}
+    Return
+  ${EndIf}
   ${Do}
     nsExec::Exec 'cmd /c tasklist /FI "IMAGENAME eq ${APP_EXE}" /NH | find /I "${APP_EXE}"'
     Pop $0
@@ -106,6 +127,13 @@ Function .onInit
     Abort
   ${EndIf}
   SetRegView 64
+  ; Upgrade into the existing directory (InstallDirRegKey reads the 32-bit view); /D= still wins.
+  ${If} $INSTDIR == "$PROGRAMFILES64\NyaRemoteControl\Client"
+    ReadRegStr $0 HKLM "${UNINST_KEY}" "InstallLocation"
+    ${If} $0 != ""
+      StrCpy $INSTDIR $0
+    ${EndIf}
+  ${EndIf}
 FunctionEnd
 
 Function un.onInit
@@ -129,6 +157,12 @@ FunctionEnd
 
 Section "Install"
   Call EnsureAppClosed
+  ; Shortcuts for every user; 0.2.0 put them in the installing user's profile.
+  Delete "$DESKTOP\NyaRemoteControl 客户端.lnk"
+  Delete "$SMPROGRAMS\NyaRemoteControl\NyaRemoteControl 客户端.lnk"
+  Delete "$SMPROGRAMS\NyaRemoteControl\卸载 NyaRemoteControl 客户端.lnk"
+  RMDir "$SMPROGRAMS\NyaRemoteControl"
+  SetShellVarContext all
 
   SetOutPath "$INSTDIR"
   File /r "${SOURCE_DIR}\*.*"
@@ -150,10 +184,23 @@ Section "Install"
   WriteRegDWORD HKLM "${UNINST_KEY}" "NoRepair" 1
 
   Call CheckWebView2
+
+  ; The client updating itself (/S /UPDATE): start the new version as the user.
+  ${GetParameters} $0
+  ClearErrors
+  ${GetOptions} $0 "/UPDATE" $1
+  ${IfNot} ${Errors}
+    Exec '"$WINDIR\explorer.exe" "$INSTDIR\${APP_EXE}"'
+  ${EndIf}
 SectionEnd
 
 Section "Uninstall"
   Call un.EnsureAppClosed
+  Delete "$DESKTOP\NyaRemoteControl 客户端.lnk"
+  Delete "$SMPROGRAMS\NyaRemoteControl\NyaRemoteControl 客户端.lnk"
+  Delete "$SMPROGRAMS\NyaRemoteControl\卸载 NyaRemoteControl 客户端.lnk"
+  RMDir "$SMPROGRAMS\NyaRemoteControl"
+  SetShellVarContext all
   Delete "$DESKTOP\NyaRemoteControl 客户端.lnk"
   Delete "$SMPROGRAMS\NyaRemoteControl\NyaRemoteControl 客户端.lnk"
   Delete "$SMPROGRAMS\NyaRemoteControl\卸载 NyaRemoteControl 客户端.lnk"

@@ -93,6 +93,11 @@ pub enum UiEvent {
     NeedPairing(std::sync::mpsc::Sender<Option<String>>),
     /// Hardware decoding summary of this computer (worker thread).
     DecodeSummary(String),
+    /// Newest client release (update check).
+    UpdateChecked(Result<nya_win::update::Release, String>),
+    /// Installer download progress, percent.
+    UpdateProgress(u32),
+    UpdateDownloaded(Result<std::path::PathBuf, String>),
     /// A request from the launcher page.
     Web(nya_webui::Call),
     /// Late answer to a launcher request (work done on another thread).

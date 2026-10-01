@@ -132,6 +132,8 @@ impl App {
             "version": crate::version(),
             "computer": self.client_name(),
             "client_name": self.cfg.client_name,
+            "check_updates": self.cfg.check_updates,
+            "update": self.updates.info,
             "computer_name": std::env::var("COMPUTERNAME").unwrap_or_default(),
             "decode": self.decode_summary,
             "hosts": hosts,
@@ -286,6 +288,18 @@ impl App {
                 let a = args(&c)?;
                 let h = self.cfg.hosts.iter_mut().find(|h| h.address == a.address).ok_or("设备不存在")?;
                 h.settings = None;
+                self.save_cfg()
+            })(),
+            "update_check" => {
+                self.check_update();
+                Ok(Value::Null)
+            }
+            "update_apply" => self.install_update().map(|()| Value::Null),
+            "set_check_updates" => (|| {
+                self.cfg.check_updates = c.args.get("on").and_then(Value::as_bool).unwrap_or(true);
+                if self.cfg.check_updates && self.updates.info.state == "idle" {
+                    self.check_update();
+                }
                 self.save_cfg()
             })(),
             "set_client_name" => (|| {
