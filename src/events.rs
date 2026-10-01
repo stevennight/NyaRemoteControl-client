@@ -62,6 +62,8 @@ pub struct ConnectDone {
 pub enum UiEvent {
     Connected,
     SessionInfo(pb::SessionInfo),
+    /// Who operates the host (several clients connected).
+    Role(pb::SessionRole),
     GamepadRumble(pb::GamepadRumble),
     StreamStarted(pb::StreamStarted),
     /// (slot, message)

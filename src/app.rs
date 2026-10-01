@@ -743,6 +743,11 @@ impl App {
                         s.usb_detach(&busid);
                     }
                 }
+                Action::TakeControl(kick) => {
+                    if let Some(s) = &mut self.session {
+                        s.take_control(kick);
+                    }
+                }
                 Action::SetMic(on) => {
                     if let Some(s) = &mut self.session {
                         s.set_mic(on);
@@ -1285,6 +1290,16 @@ impl ApplicationHandler<UiEvent> for App {
                 let Some(s) = self.session.as_mut() else { return };
                 match other {
                     UiEvent::Connected => s.status.clear(),
+                    UiEvent::Role(r) => {
+                        let was_watching = s.watching();
+                        s.role = Some(r);
+                        if was_watching && !s.watching() {
+                            s.notice("你现在操作被控端".into(), Duration::from_secs(4));
+                        } else if !was_watching && s.watching() {
+                            let who = s.role.as_ref().map(|r| r.controller.clone()).unwrap_or_default();
+                            s.notice(format!("{who} 接管了操作，你现在只能观看"), Duration::from_secs(6));
+                        }
+                    }
                     UiEvent::SessionInfo(i) => {
                         s.on_session_info(i, self.focused);
                         self.sync_extras = true;

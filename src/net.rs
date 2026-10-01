@@ -293,6 +293,7 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
                 };
                 match m.msg {
                     Some(Msg::SessionInfo(i)) => sinks.ui.send(UiEvent::SessionInfo(i)),
+                    Some(Msg::SessionRole(r)) => sinks.ui.send(UiEvent::Role(r)),
                     // The decoder notices the new stream id itself; frames may arrive first.
                     Some(Msg::StreamStarted(s)) => sinks.ui.send(UiEvent::StreamStarted(s)),
                     Some(Msg::StreamError(e)) => sinks.ui.send(UiEvent::StreamError(e.slot, e.message)),

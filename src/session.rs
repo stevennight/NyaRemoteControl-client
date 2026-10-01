@@ -107,6 +107,9 @@ pub struct Session {
     pub vd_supported: bool,
     /// Turn the microphone on once the host says it can take it.
     pub mic_auto: bool,
+    /// Who operates the host when other clients are connected too
+    /// (`None`: an older host, or nobody else; this client operates it).
+    pub role: Option<pb::SessionRole>,
     /// Virtual display follows the window size.
     pub vd_follow_window: bool,
     pub info: Option<pb::SessionInfo>,
@@ -207,6 +210,7 @@ impl Session {
             status_until: None,
             vd_supported: false,
             mic_auto: false,
+            role: None,
             vd_follow_window: false,
             info: None,
             stream: None,
@@ -228,7 +232,22 @@ impl Session {
     }
 
     pub fn send_input(&self, ev: Ev) {
+        if self.watching() {
+            return; // the host ignores it anyway
+        }
         let _ = self.net_tx.send(NetCmd::Input(pb::InputMsg { ev: Some(ev) }));
+    }
+
+    /// Another client operates the host; this one only watches.
+    pub fn watching(&self) -> bool {
+        self.role.as_ref().is_some_and(|r| !r.controlling)
+    }
+
+    /// Operate the host from now on; the other client watches, or is
+    /// disconnected with `kick`.
+    pub fn take_control(&mut self, kick: bool) {
+        let _ = self.net_tx.send(ctl(Msg::TakeControl(pb::TakeControl { kick })));
+        self.status = "正在接管操作…".into();
     }
 
     pub fn release_all(&self) {

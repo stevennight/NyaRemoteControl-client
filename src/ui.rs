@@ -21,6 +21,8 @@ pub enum Action {
     SetGrab(bool),
     SetPolicy(nya_proto::pb::BitratePolicy),
     SetMic(bool),
+    /// Watching: operate the host (true: disconnect the current operator).
+    TakeControl(bool),
     ToggleUsb,
     InstallUsbipd,
     RefreshUsb,
@@ -383,6 +385,33 @@ pub fn auto_hide_bar(ctx: &egui::Context, id: &str, pinned: bool, tab: &str, con
     ctx.data_mut(|d| d.insert_temp(state_id, (rect, until, menu_open)));
 }
 
+/// Another client operates the host: say so, offer to take over.
+fn watching_bar(ctx: &egui::Context, s: &Session, actions: &mut Vec<Action>) {
+    let who = s.role.as_ref().map(|r| r.controller.clone()).filter(|n| !n.is_empty()).unwrap_or_else(|| "另一个客户端".into());
+    egui::Area::new(egui::Id::new("watching"))
+        .anchor(Align2::CENTER_TOP, [0.0, 56.0])
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::NONE
+                .fill(Color32::from_rgba_unmultiplied(28, 30, 36, 235))
+                .stroke(egui::Stroke::new(1.0_f32, Color32::from_white_alpha(18)))
+                .corner_radius(10)
+                .inner_margin(egui::Margin::symmetric(12, 6))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("正在观看 · {who} 正在操作")).color(Color32::WHITE));
+                        ui.add_space(6.0);
+                        if ui.button("接管操作").on_hover_text(format!("由你操作被控端，{who} 改为观看")).clicked() {
+                            actions.push(Action::TakeControl(false));
+                        }
+                        if ui.button(RichText::new("顶掉对方").color(DANGER)).on_hover_text(format!("由你操作被控端，并断开 {who} 的连接")).clicked() {
+                            actions.push(Action::TakeControl(true));
+                        }
+                    });
+                });
+        });
+}
+
 /// Toolbar and statistics shown over the remote picture.
 pub fn session_overlay(
     ctx: &egui::Context,
@@ -405,6 +434,10 @@ pub fn session_overlay(
                 ui.painter().circle_filled(dot.center(), 3.5, OK);
                 ui.add_space(4.0);
                 ui.label(RichText::new(&s.label).strong().color(Color32::WHITE));
+                if let Some(r) = s.role.as_ref().filter(|r| r.controlling && !r.viewers.is_empty()) {
+                    ui.label(RichText::new(format!("· {} 人观看", r.viewers.len())).small().color(DIM))
+                        .on_hover_text(format!("正在观看：{}", r.viewers.join("、")));
+                }
                 bar_separator(ui);
 
                 // egui 0.31 returns a menu's contents only on the frame it closes, so
@@ -440,6 +473,9 @@ pub fn session_overlay(
         },
     );
 
+    if s.watching() {
+        watching_bar(ctx, s, actions);
+    }
     if !s.status.is_empty() {
         egui::Area::new(egui::Id::new("status"))
             .anchor(Align2::CENTER_BOTTOM, [0.0, -24.0])
