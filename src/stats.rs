@@ -2,6 +2,9 @@
 
 use std::sync::Mutex;
 
+use nya_media::jitter::JitterStats;
+use nya_proto::stats::Rolling;
+
 #[derive(Default)]
 pub struct Stats {
     pub rtt_ms: f32,
@@ -15,6 +18,12 @@ pub struct Stats {
     pub frames_dropped: u32,
     pub bytes: u64,
     pub decoder: String,
+    /// Audio jitter buffer (published by the audio thread).
+    pub audio: Option<JitterStats>,
+    /// Samples of the last 10 s, for the 99th percentiles.
+    decode_window: Rolling,
+    render_window: Rolling,
+    latency_window: Rolling,
     /// Totals since start (never reset), for the "no picture" status log.
     pub total_rx_frames: u64,
     pub total_rx_bytes: u64,
@@ -56,40 +65,41 @@ impl Shared {
 #[derive(Default, Clone)]
 pub struct Summary {
     pub rtt_ms: f32,
+    /// Medians of the interval, and 99th percentiles of the last 10 s.
     pub decode_ms: f32,
+    pub decode_p99: f32,
     pub render_ms: f32,
+    pub render_p99: f32,
     pub latency_ms: f32,
+    pub latency_p99: f32,
     pub fps: u32,
     pub dropped: u32,
     pub kbps: u32,
     pub decoder: String,
-}
-
-fn median(v: &mut [f32]) -> f32 {
-    if v.is_empty() {
-        return 0.0;
-    }
-    v.sort_by(|a, b| a.total_cmp(b));
-    v[v.len() / 2]
+    pub audio: Option<JitterStats>,
 }
 
 impl Shared {
     /// Take and reset the per-interval counters.
     pub fn take_summary(&self, secs: f32) -> Summary {
         self.with(|s| {
+            let (decode_ms, decode_p99) = s.decode_window.close(std::mem::take(&mut s.decode_ms));
+            let (render_ms, render_p99) = s.render_window.close(std::mem::take(&mut s.render_ms));
+            let (latency_ms, latency_p99) = s.latency_window.close(std::mem::take(&mut s.latency_ms));
             let sum = Summary {
                 rtt_ms: s.rtt_ms,
-                decode_ms: median(&mut s.decode_ms),
-                render_ms: median(&mut s.render_ms),
-                latency_ms: median(&mut s.latency_ms),
+                decode_ms,
+                decode_p99,
+                render_ms,
+                render_p99,
+                latency_ms,
+                latency_p99,
                 fps: (s.frames_rendered as f32 / secs).round() as u32,
                 dropped: s.frames_dropped,
                 kbps: (s.bytes as f32 * 8.0 / 1000.0 / secs) as u32,
                 decoder: s.decoder.clone(),
+                audio: s.audio,
             };
-            s.decode_ms.clear();
-            s.render_ms.clear();
-            s.latency_ms.clear();
             s.frames_decoded = 0;
             s.frames_rendered = 0;
             s.frames_dropped = 0;

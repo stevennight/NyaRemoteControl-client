@@ -1,29 +1,27 @@
-//! Audio playback: Opus decode → jitter buffer → WASAPI.
+//! Audio playback: Opus decode → adaptive jitter buffer → WASAPI.
 
-use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use nya_media::audio::OpusDecoder;
+use nya_media::jitter::JitterBuffer;
 use nya_proto::frame::AudioPacket;
 use nya_win::audio::AudioRenderer;
 
-const SAMPLES_PER_MS: usize = 48 * 2;
-/// Buffer this much before (re)starting playback.
-const PREBUFFER_MS: usize = 30;
-/// Beyond this, drop old audio to keep latency bounded.
-const MAX_BUFFER_MS: usize = 120;
-/// Keep roughly this much queued in the device.
-const DEVICE_TARGET_MS: u32 = 20;
+use crate::stats::Shared;
 
-pub fn spawn(rx: Receiver<AudioPacket>) {
+/// Keep roughly this much queued in the device.
+const DEVICE_TARGET_MS: usize = 20;
+
+pub fn spawn(rx: Receiver<AudioPacket>, stats: Arc<Shared>) {
     std::thread::Builder::new()
         .name("nya-audio".into())
-        .spawn(move || run(rx))
+        .spawn(move || run(rx, stats))
         .expect("spawn audio thread");
 }
 
-fn run(rx: Receiver<AudioPacket>) {
+fn run(rx: Receiver<AudioPacket>, stats: Arc<Shared>) {
     nya_win::com_init();
     nya_win::mmcss_boost("Pro Audio");
     let mut decoder = match OpusDecoder::new() {
@@ -35,45 +33,35 @@ fn run(rx: Receiver<AudioPacket>) {
     };
     let mut renderer: Option<AudioRenderer> = None;
     let mut retry_at = Instant::now();
-    let mut buf: VecDeque<f32> = VecDeque::new();
-    let mut scratch = Vec::new();
-    let mut last_seq: Option<u32> = None;
-    let mut playing = false;
+    let mut jb = JitterBuffer::new();
+    let mut chunk = Vec::new();
+    let epoch = Instant::now();
+    let now_us = || epoch.elapsed().as_micros() as u64;
+    let mut published = Instant::now();
 
     loop {
         match rx.recv_timeout(Duration::from_millis(3)) {
             Ok(p) => {
-                // Conceal short losses with silence so timing stays right.
-                if let Some(prev) = last_seq {
-                    let gap = p.seq.wrapping_sub(prev).wrapping_sub(1);
-                    if (1..=5).contains(&gap) {
-                        buf.extend(std::iter::repeat(0.0).take(gap as usize * 10 * SAMPLES_PER_MS));
-                    }
-                }
-                last_seq = Some(p.seq);
-                scratch.clear();
-                if let Err(e) = decoder.decode(&p.data, &mut scratch) {
-                    tracing::debug!("opus decode: {e:#}");
-                }
-                buf.extend(scratch.iter().copied());
-                for p in rx.try_iter() {
-                    last_seq = Some(p.seq);
-                    scratch.clear();
-                    let _ = decoder.decode(&p.data, &mut scratch);
-                    buf.extend(scratch.iter().copied());
+                for p in std::iter::once(p).chain(rx.try_iter()) {
+                    jb.push(p.seq, p.capture_ts_us, now_us(), |out| {
+                        if let Err(e) = decoder.decode(&p.data, out) {
+                            tracing::debug!("opus decode: {e:#}");
+                        }
+                    });
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
         }
-
-        if buf.len() > MAX_BUFFER_MS * SAMPLES_PER_MS {
-            let excess = buf.len() - PREBUFFER_MS * SAMPLES_PER_MS;
-            buf.drain(..excess - excess % 2);
+        if published.elapsed() >= Duration::from_millis(500) {
+            published = Instant::now();
+            let s = jb.stats();
+            stats.with(|st| st.audio = Some(s));
         }
 
         if renderer.is_none() {
             if Instant::now() < retry_at {
+                jb.reset(); // nowhere to play: don't pile up audio
                 continue;
             }
             match AudioRenderer::new() {
@@ -85,16 +73,9 @@ fn run(rx: Receiver<AudioPacket>) {
                 }
             }
         }
-        if !playing {
-            if buf.len() >= PREBUFFER_MS * SAMPLES_PER_MS {
-                playing = true;
-            } else {
-                continue;
-            }
-        }
         let r = renderer.as_mut().unwrap();
         let queued = match r.queued_frames() {
-            Ok(q) => q,
+            Ok(q) => q as usize,
             Err(_) => {
                 renderer = None; // device changed
                 continue;
@@ -104,22 +85,13 @@ fn run(rx: Receiver<AudioPacket>) {
         if queued >= target {
             continue;
         }
-        let want = ((target - queued) as usize * 2).min(buf.len());
-        if want == 0 {
-            if queued == 0 {
-                playing = false; // underrun: prebuffer again
-            }
+        chunk.clear();
+        if jb.pull(now_us(), target - queued, queued, &mut chunk) == 0 {
             continue;
         }
-        let chunk: Vec<f32> = buf.drain(..want - want % 2).collect();
-        match r.write(&chunk) {
-            Ok(n) => {
-                // Put back what didn't fit.
-                for &s in chunk[n * 2..].iter().rev() {
-                    buf.push_front(s);
-                }
-            }
-            Err(_) => renderer = None,
+        // The device buffer is larger than the target, so this all fits.
+        if r.write(&chunk).is_err() {
+            renderer = None;
         }
     }
 }

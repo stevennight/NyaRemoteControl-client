@@ -162,7 +162,7 @@ impl Session {
         }
         .spawn(dev.clone(), video_rx);
         if opts.audio {
-            crate::audio::spawn(audio_rx);
+            crate::audio::spawn(audio_rx, stats.clone());
         }
         let clip_files = link.neg.has(nya_proto::pb::Feature::FileTransfer) && link.neg.has(nya_proto::pb::Feature::ClipboardFiles);
         let clip_tx = opts.clipboard.then(|| {
@@ -671,22 +671,42 @@ fn stream_lines(lines: &mut Vec<String>, stream: Option<&pb::StreamStarted>, ser
             lines.push("HDR  被控端显示器开启了 HDR，已转换为 SDR 传输".into());
         }
     }
-    let (sfps, skbps, enc_ms, xfer_ms, target, note) = server
-        .map(|x| (x.fps, x.bitrate_kbps, x.encode_ms_p50, x.transfer_ms_p50, x.target_kbps, x.bitrate_note.clone()))
+    let (sfps, skbps, enc_ms, enc_p99, xfer_ms, target, note) = server
+        .map(|x| (x.fps, x.bitrate_kbps, x.encode_ms_p50, x.encode_ms_p99, x.transfer_ms_p50, x.target_kbps, x.bitrate_note.clone()))
         .unwrap_or_default();
+    // Older hosts don't report the 99th percentile.
+    let p99 = |v: f32| if v > 0.0 { format!("{v:.1}") } else { "—".into() };
     lines.push(format!("帧率  被控端 {sfps} / 本机 {}   丢帧 {}", s.fps, s.dropped));
     let kbps = if main { skbps.max(s.kbps) } else { skbps };
     lines.push(format!("码率  实际 {:.1} Mbps   上限 {:.1} Mbps", kbps as f32 / 1000.0, target as f32 / 1000.0));
     if main && !note.is_empty() {
         lines.push(format!("策略  {note}"));
     }
+    let latency = format!("延迟  端到端 {:.1} ms（P99 {:.1}）", s.latency_ms, s.latency_p99);
     if main {
-        lines.push(format!("延迟  端到端 {:.1} ms   RTT {:.1} ms", s.latency_ms, s.rtt_ms));
+        lines.push(format!("{latency}   RTT {:.1} ms", s.rtt_ms));
     } else {
-        lines.push(format!("延迟  端到端 {:.1} ms", s.latency_ms));
+        lines.push(latency);
     }
-    lines.push(format!("耗时  编码 {enc_ms:.1}  跨显卡 {xfer_ms:.1}  解码 {:.1}  渲染 {:.1} ms", s.decode_ms, s.render_ms));
+    lines.push(format!(
+        "耗时（中位/P99）  编码 {enc_ms:.1}/{}  解码 {:.1}/{:.1}  渲染 {:.1}/{:.1} ms",
+        p99(enc_p99),
+        s.decode_ms,
+        s.decode_p99,
+        s.render_ms,
+        s.render_p99
+    ));
+    if xfer_ms > 0.0 {
+        lines.push(format!("耗时  跨显卡传输 {xfer_ms:.1} ms"));
+    }
     lines.push(format!("解码器  {}", s.decoder));
+    if let Some(a) = s.audio.filter(|_| main) {
+        let speed = if a.speed != 1.0 { format!("  调速 {:+.2}%", (a.speed - 1.0) * 100.0) } else { String::new() };
+        lines.push(format!(
+            "声音  缓冲 {:.0}/{:.0} ms  抖动 {:.0} ms{speed}  断音 {}  丢弃 {} ms",
+            a.level_ms, a.target_ms, a.jitter_ms, a.underruns, a.dropped_ms
+        ));
+    }
 }
 
 impl Session {
