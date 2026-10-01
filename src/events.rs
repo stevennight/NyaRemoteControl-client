@@ -83,6 +83,8 @@ pub enum UiEvent {
     FileResult(pb::FileResult),
     Transfer(TransferUpdate),
     UsbStatus(pb::UsbStatus),
+    /// What became of our shared folders on the host.
+    FolderMount(pb::FolderMountStatus),
     /// (usbipd installed, devices).
     UsbDevices(bool, Result<Vec<crate::usb::UsbDevice>, String>),
     /// usbipd-win install progress: (still running, message)

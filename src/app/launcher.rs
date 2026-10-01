@@ -208,6 +208,16 @@ impl App {
                 self.connect(address, a.name.filter(|n| !n.trim().is_empty()), None);
                 Ok(Value::Null)
             })(),
+            "pick_folder" => {
+                let picked = rfd::FileDialog::new().set_title("选择要共享给被控端的文件夹").pick_folder();
+                Ok(match picked {
+                    Some(p) => json!({
+                        "path": p.to_string_lossy(),
+                        "name": p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.to_string_lossy().trim_end_matches(['\\', ':']).to_owned()),
+                    }),
+                    None => Value::Null,
+                })
+            }
             "cancel_connect" => {
                 self.cancel_connect();
                 Ok(Value::Null)

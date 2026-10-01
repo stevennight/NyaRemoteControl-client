@@ -136,6 +136,8 @@ pub struct Params {
     pub start: pb::StartStream,
     /// Streams of extra windows (slot > 0), replayed after a reconnect.
     pub extra: std::collections::BTreeMap<u32, pb::StartStream>,
+    /// Folders shown on the host as a drive (FEATURE_FOLDER_MOUNT).
+    pub shares: Arc<nya_transport::folders::Shares>,
 }
 
 pub struct Sinks {
@@ -232,6 +234,9 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
         for s in p.extra.values() {
             write_msg(&mut send, &ctl(Msg::StartStream(s.clone()))).await?;
         }
+        if neg.has(Feature::FolderMount) && !p.shares.0.is_empty() {
+            write_msg(&mut send, &ctl(Msg::SharedFolders(p.shares.to_pb()))).await?;
+        }
         let mut input = conn.open_uni().await?;
         input.set_priority(20)?;
         let mut prelude = Vec::new();
@@ -260,15 +265,24 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
     // Control messages from spawned tasks (failed clipboard sends).
     let (internal_tx, mut internal_rx) = mpsc::unbounded_channel::<pb::ControlMsg>();
     let usb_on = neg.has(Feature::UsbRedirect);
+    // The host reads our shared folders only if we shared some.
+    let shares = (neg.has(Feature::FolderMount) && !p.shares.0.is_empty()).then(|| p.shares.clone());
     let bidi = tokio::spawn({
         let conn = conn.clone();
         async move {
             while let Ok((send, mut recv)) = conn.accept_bi().await {
+                let shares = shares.clone();
                 tokio::spawn(async move {
-                    match (read_varint(&mut recv).await, read_varint(&mut recv).await) {
-                        (Ok(Some(stream_type::TUNNEL)), Ok(Some(port))) if usb_on => {
+                    match read_varint(&mut recv).await {
+                        Ok(Some(stream_type::TUNNEL)) if usb_on => {
+                            let Ok(Some(port)) = read_varint(&mut recv).await else { return };
                             if let Err(e) = crate::usb::tunnel(send, recv, port).await {
                                 tracing::debug!("usb tunnel: {e:#}");
+                            }
+                        }
+                        Ok(Some(stream_type::FS)) if shares.is_some() => {
+                            if let Err(e) = nya_transport::folders::serve_stream(send, recv, shares.unwrap()).await {
+                                tracing::debug!("folder request: {e:#}");
                             }
                         }
                         _ => {
@@ -336,6 +350,7 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
                         sinks.ui.send(UiEvent::FileResult(r));
                     }
                     Some(Msg::UsbStatus(u)) => sinks.ui.send(UiEvent::UsbStatus(u)),
+                    Some(Msg::FolderMountStatus(s)) => sinks.ui.send(UiEvent::FolderMount(s)),
                     Some(Msg::GamepadRumble(r)) => sinks.ui.send(UiEvent::GamepadRumble(r)),
                     Some(Msg::Bye(b)) => break End::Fatal(format!("被控端断开：{}", b.reason)),
                     Some(other) => tracing::debug!("ignoring {other:?}"),

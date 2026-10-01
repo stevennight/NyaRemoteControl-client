@@ -80,6 +80,44 @@ pub struct Defaults {
     pub mic: bool,
     /// Capture the keyboard (Win key combinations go to the host) after connecting.
     pub grab_keyboard: bool,
+    /// Folders of this computer shown on the host as a drive (needs WinFsp there).
+    pub shared_folders: Vec<SharedFolder>,
+}
+
+/// One folder shared with the host.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SharedFolder {
+    pub path: String,
+    /// Directory name on the host's drive.
+    pub name: String,
+    pub read_only: bool,
+}
+
+impl Defaults {
+    /// The shared folders that exist, with unique names.
+    pub fn shares(&self) -> nya_transport::folders::Shares {
+        let mut out: Vec<nya_transport::folders::Share> = Vec::new();
+        for f in &self.shared_folders {
+            let root = std::path::PathBuf::from(&f.path);
+            if !root.is_dir() {
+                tracing::warn!("shared folder {} is missing; not shared", f.path);
+                continue;
+            }
+            let base = match f.name.trim() {
+                "" => root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "共享".into()),
+                n => n.replace(['/', '\\', ':'], "_"),
+            };
+            let mut name = base.clone();
+            let mut i = 2;
+            while out.iter().any(|s| s.name.eq_ignore_ascii_case(&name)) {
+                name = format!("{base} ({i})");
+                i += 1;
+            }
+            out.push(nya_transport::folders::Share { name, root, read_only: f.read_only });
+        }
+        nya_transport::folders::Shares(out)
+    }
 }
 
 impl Default for Defaults {
@@ -109,6 +147,7 @@ impl Default for Defaults {
             multi_window: false,
             mic: false,
             grab_keyboard: false,
+            shared_folders: Vec::new(),
         }
     }
 }

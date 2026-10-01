@@ -519,6 +519,7 @@ impl App {
             caps,
             start: start_request(&d, vd),
             extra: Default::default(),
+            shares: std::sync::Arc::new(d.shares()),
         };
         let opts = SessionOptions { hw_decode: d.hw_decode, audio: d.audio, clipboard: d.clipboard };
         let mut session = Session::start(&self.rt, *link, params, &dev, &opts, self.ui_tx.for_conn(self.conn_id), label);
@@ -1278,6 +1279,21 @@ impl ApplicationHandler<UiEvent> for App {
             UiEvent::UsbStatus(st) => {
                 if let Some(s) = &mut self.session {
                     s.on_usb_status(st);
+                }
+            }
+            UiEvent::FolderMount(st) => {
+                if let Some(s) = &mut self.session {
+                    let msg = if st.mounted {
+                        format!("共享文件夹已出现在被控端的 {} 盘", st.mount_point.trim_end_matches(':'))
+                    } else if !st.message.is_empty() {
+                        format!("共享文件夹没有挂载：{}", st.message)
+                    } else {
+                        String::new()
+                    };
+                    if !msg.is_empty() {
+                        tracing::info!("{msg}");
+                        s.notice(msg, Duration::from_secs(8));
+                    }
                 }
             }
             UiEvent::UsbipdInstall(running, msg) => {
