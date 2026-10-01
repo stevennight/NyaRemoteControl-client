@@ -34,8 +34,16 @@ use winit::event_loop::EventLoop;
 use crate::config::ClientConfig;
 use crate::events::{Ui, UiEvent};
 
+/// Version for display: `0.2.0 (1a2b3c4d)` (commit id from build.rs; `+` = uncommitted changes).
+pub fn version() -> String {
+    match env!("NYA_GIT_HASH") {
+        "" => env!("CARGO_PKG_VERSION").to_owned(),
+        h => format!("{} ({h})", env!("CARGO_PKG_VERSION")),
+    }
+}
+
 #[derive(Parser)]
-#[command(name = "nya-client", version, about = "NyaRemoteControl 客户端")]
+#[command(name = "nya-client", version = concat!(env!("CARGO_PKG_VERSION"), " ", env!("NYA_GIT_HASH")), about = "NyaRemoteControl 客户端")]
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,

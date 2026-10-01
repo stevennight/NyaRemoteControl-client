@@ -129,7 +129,7 @@ impl App {
             })
             .collect();
         json!({
-            "version": env!("CARGO_PKG_VERSION"),
+            "version": crate::version(),
             "computer": self.client_name(),
             "client_name": self.cfg.client_name,
             "computer_name": std::env::var("COMPUTERNAME").unwrap_or_default(),

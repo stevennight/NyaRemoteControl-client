@@ -159,6 +159,14 @@ cargo build --release      # 会自动用 npm 构建界面（../common/web），
 
 主界面是 `../common/web` 里的 Svelte 页面，编译时嵌入 exe。改界面时可以在那里运行 `npm run dev`，在浏览器里用示例数据预览；或者设置环境变量 `NYA_WEB_DEV=http://localhost:5173` 再运行客户端，直接加载开发服务器。
 
+### 安装包、版本和发布
+
+- **版本号**：`VERSION` 文件（`主.次.修订`，可带 `-beta.1` 这样的后缀），和 `Cargo.toml` 的版本保持一致。客户端和被控端各自独立编号。“关于与诊断”里显示的版本带提交号，例如 `0.2.0 (0ac62421)`（`+` 表示有未提交的改动）。
+- **本地打安装包**：`.\scripts\build-release.ps1`（需要 NSIS：`winget install NSIS.NSIS`），在 `release\` 生成安装包 `NyaRemoteControl-Client_<版本>_x64-setup.exe`、便携版 zip 和对应的 `.sha256`。
+- **发布新版本**：`.\scripts\release.ps1 0.2.1`：改 `VERSION` 和 `Cargo.toml`，把当前 common 的提交记到 `COMMON_REF`（common 要先推送），提交并打 tag `v0.2.1`。再 `git push origin HEAD v0.2.1`（或加 `-Push`），GitHub Actions 构建安装包并发布到 Releases；带后缀的版本发布为预发布版。
+- **CI**：推送到 main 或提 PR 时用最新的 common 编译、测试并打便携 zip。
+- 安装包：装到 `C:\Program Files\NyaRemoteControl\Client`，创建开始菜单和桌面快捷方式；升级时保留已保存的设备和设置（在 `%APPDATA%\NyaRemoteControl\client`，卸载也不删）。缺少 WebView2 运行库时会提示下载。
+
 ## 仓库布局
 
 本项目由三个仓库组成，需要克隆到同一个父目录下（server / client 通过 `../common` 引用公共库）：

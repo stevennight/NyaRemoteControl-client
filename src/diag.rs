@@ -21,7 +21,7 @@ pub fn report() -> anyhow::Result<String> {
     let mut o = String::new();
     nya_win::com_init();
     out!(o, "== NyaRemoteControl 客户端诊断 ==");
-    out!(o, "版本 {} / 协议 {}.{}", env!("CARGO_PKG_VERSION"), nya_proto::PROTO_MAJOR, nya_proto::PROTO_MINOR);
+    out!(o, "版本 {} / 协议 {}.{}", crate::version(), nya_proto::PROTO_MAJOR, nya_proto::PROTO_MINOR);
     let (c, u) = nya_media::ffmpeg_versions();
     out!(o, "FFmpeg avcodec {c} / avutil {u}");
     let topo = Topology::enumerate()?;
