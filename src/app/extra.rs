@@ -48,6 +48,13 @@ impl ExtraWindow {
     pub fn focused(&self) -> bool {
         self.focused
     }
+
+    /// Follow the window's monitor into or out of HDR mode.
+    pub fn refresh_display(&mut self) {
+        if self.renderer.refresh_display() {
+            self.window.request_redraw();
+        }
+    }
 }
 
 impl App {

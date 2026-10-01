@@ -84,6 +84,8 @@ pub struct Defaults {
     pub shared_folders: Vec<SharedFolder>,
     /// What to do with the host's print jobs: "print" (default printer) | "open" | "save"
     pub print_mode: String,
+    /// HDR10 video when the host desktop and this window's monitor are HDR.
+    pub hdr: bool,
 }
 
 /// One folder shared with the host.
@@ -151,6 +153,7 @@ impl Default for Defaults {
             grab_keyboard: false,
             shared_folders: Vec::new(),
             print_mode: "print".into(),
+            hdr: true,
         }
     }
 }

@@ -151,7 +151,8 @@ fn vd_dims(w: u32, h: u32) -> (u32, u32) {
     ((w & !7).max(640), (h & !1).max(480))
 }
 
-fn start_request(d: &Defaults, setup: Option<pb::DisplaySetup>) -> pb::StartStream {
+/// `hdr`: this window's monitor shows HDR (and the user allows HDR10).
+fn start_request(d: &Defaults, setup: Option<pb::DisplaySetup>, hdr: bool) -> pb::StartStream {
     let game = d.mode.eq_ignore_ascii_case("game");
     pb::StartStream {
         // The first virtual screen is the host's primary display.
@@ -172,6 +173,7 @@ fn start_request(d: &Defaults, setup: Option<pb::DisplaySetup>) -> pb::StartStre
                 "datagram" => pb::VideoTransport::Datagram,
                 _ => pb::VideoTransport::Auto,
             } as i32,
+            hdr,
         }),
         encoder_preference: d.encoder.clone(),
     }
@@ -517,7 +519,7 @@ impl App {
             identity: self.identity.clone(),
             name: self.client_name(),
             caps,
-            start: start_request(&d, vd),
+            start: start_request(&d, vd, d.hdr && self.renderer.as_ref().is_some_and(|r| r.display_hdr())),
             extra: Default::default(),
             shares: std::sync::Arc::new(d.shares()),
         };
@@ -1181,6 +1183,10 @@ impl ApplicationHandler<UiEvent> for App {
                 self.dropped.push(p.clone());
             }
             WindowEvent::Moved(_) => {
+                // Onto an HDR monitor or off it: the swap chain follows.
+                if let Some(r) = self.renderer.as_mut() {
+                    r.refresh_display();
+                }
                 // Moving to a monitor on another GPU: follow it (design doc §3.5, client side).
                 if let (Some(m), Ok(topo)) = (window.current_monitor(), Topology::enumerate()) {
                     if let Some(a) = topo.adapter_for_monitor(m.hmonitor()) {
@@ -1447,6 +1453,13 @@ impl App {
             if s.tick() {
                 redraw = s.show_stats;
                 self.update_title();
+                // HDR switched on or off in Windows' display settings.
+                if let Some(r) = self.renderer.as_mut() {
+                    redraw |= r.refresh_display();
+                }
+                for w in self.extras.values_mut() {
+                    w.refresh_display();
+                }
             }
         }
         if self.repaint_at.is_some_and(|t| Instant::now() >= t) {

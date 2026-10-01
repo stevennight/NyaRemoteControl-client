@@ -30,6 +30,17 @@ pub enum VideoIn {
     Device(D3dDevice),
 }
 
+/// How sample values are stored, for the YUV offsets and scales.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Depth {
+    /// 8-bit unorm.
+    Eight,
+    /// 10-bit in the top bits of 16 (P010).
+    TenMsb,
+    /// 10-bit in the low bits of 16 (FFmpeg's yuv420p10le).
+    TenLsb,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotKind {
     /// Y (R8) + interleaved UV (R8G8), either one NV12 texture or two textures.
@@ -46,6 +57,9 @@ pub struct Slot {
     pub height: u32,
     pub full_range: bool,
     pub matrix: Matrix,
+    pub depth: Depth,
+    /// HDR10 (PQ, BT.2020).
+    pub pq: bool,
     pub srvs: Vec<ID3D11ShaderResourceView>,
     pub capture_ts: u64,
 }
@@ -125,6 +139,17 @@ impl Ring {
                         let s = vec![srv(dev, &t, DXGI_FORMAT_R8G8B8A8_UNORM)?];
                         (vec![t], s)
                     }
+                    PixelLayout::P010 => {
+                        let t = mk(DXGI_FORMAT_P010, w, h)?;
+                        let s = vec![srv(dev, &t, DXGI_FORMAT_R16_UNORM)?, srv(dev, &t, DXGI_FORMAT_R16G16_UNORM)?];
+                        (vec![t], s)
+                    }
+                    PixelLayout::Yuv420p10 => {
+                        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+                        let t = vec![mk(DXGI_FORMAT_R16_UNORM, w, h)?, mk(DXGI_FORMAT_R16_UNORM, cw, ch)?, mk(DXGI_FORMAT_R16_UNORM, cw, ch)?];
+                        let s = t.iter().map(|t| srv(dev, t, DXGI_FORMAT_R16_UNORM)).collect::<Result<Vec<_>>>()?;
+                        (t, s)
+                    }
                     PixelLayout::Nv12Cpu => {
                         let y = mk(DXGI_FORMAT_R8_UNORM, w, h)?;
                         let uv = mk(DXGI_FORMAT_R8G8_UNORM, w.div_ceil(2), h.div_ceil(2))?;
@@ -150,9 +175,17 @@ impl Ring {
     }
 }
 
+fn depth_of(layout: PixelLayout) -> Depth {
+    match layout {
+        PixelLayout::P010 => Depth::TenMsb,
+        PixelLayout::Yuv420p10 => Depth::TenLsb,
+        _ => Depth::Eight,
+    }
+}
+
 fn kind_of(layout: PixelLayout) -> SlotKind {
     match layout {
-        PixelLayout::Nv12 | PixelLayout::Nv12Cpu => SlotKind::Nv12,
+        PixelLayout::Nv12 | PixelLayout::Nv12Cpu | PixelLayout::P010 => SlotKind::Nv12,
         PixelLayout::Ayuv => SlotKind::Ayuv,
         _ => SlotKind::Planar,
     }
@@ -338,6 +371,8 @@ impl VideoThread {
                                     height: f.height,
                                     full_range: f.full_range,
                                     matrix: f.matrix,
+                                    depth: depth_of(f.layout),
+                                    pq: f.pq,
                                     srvs,
                                     capture_ts: h.capture_ts_us,
                                 })

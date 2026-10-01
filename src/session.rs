@@ -674,6 +674,9 @@ fn stream_lines(lines: &mut Vec<String>, stream: Option<&pb::StreamStarted>, ser
         if st.hdr_tonemapped {
             lines.push("HDR  被控端显示器开启了 HDR，已转换为 SDR 传输".into());
         }
+        if c.hdr {
+            lines.push("HDR  HDR10 直通（HEVC 10 bit，BT.2020 PQ）".into());
+        }
     }
     let (sfps, skbps, enc_ms, enc_p99, xfer_ms, target, note) = server
         .map(|x| (x.fps, x.bitrate_kbps, x.encode_ms_p50, x.encode_ms_p99, x.transfer_ms_p50, x.target_kbps, x.bitrate_note.clone()))

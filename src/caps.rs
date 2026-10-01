@@ -5,15 +5,24 @@ use nya_win::d3d::D3dDevice;
 use windows::core::{Interface, GUID};
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11VideoDevice, D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0, D3D11_DECODER_PROFILE_H264_VLD_NOFGT,
-    D3D11_DECODER_PROFILE_HEVC_VLD_MAIN,
+    D3D11_DECODER_PROFILE_HEVC_VLD_MAIN, D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_AYUV, DXGI_FORMAT_NV12};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_AYUV, DXGI_FORMAT_NV12, DXGI_FORMAT_P010};
 
 /// `D3D11_DECODER_PROFILE_HEVC_VLD_MAIN_444` (d3d11.h, Windows SDK 10.0.26100).
 const HEVC_MAIN_444: GUID = GUID::from_u128(0x4008018f_f537_4b36_98cf_61af8a2c1a33);
 
 fn cap(codec: pb::Codec, chroma: pb::Chroma, hardware: bool) -> pb::CodecCap {
     pb::CodecCap { codec: codec as i32, chroma: chroma as i32, hardware, ..Default::default() }
+}
+
+/// HEVC Main10 (HDR10) decodes in hardware on `dev`.
+pub fn hardware_hevc_main10(dev: &D3dDevice) -> bool {
+    let Ok(vd) = dev.device.cast::<ID3D11VideoDevice>() else { return false };
+    let g = D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10;
+    let n = unsafe { vd.GetVideoDecoderProfileCount() };
+    (0..n).any(|i| unsafe { vd.GetVideoDecoderProfile(i) }.is_ok_and(|p| p == g))
+        && unsafe { vd.CheckVideoDecoderFormat(&g, DXGI_FORMAT_P010) }.is_ok_and(|b| b.as_bool())
 }
 
 /// Hardware decoder profiles supported by `dev`, as (codec, chroma).
@@ -57,5 +66,8 @@ pub fn detect(dev: &D3dDevice, hw_allowed: bool, max_fps: u32) -> pb::ClientCaps
             decoders.push(cap(c, ch, false));
         }
     }
+    // HDR10: HEVC Main10, in hardware when the GPU can, else in software.
+    let main10_hw = hw_allowed && hardware_hevc_main10(dev);
+    decoders.push(pb::CodecCap { ten_bit: true, ..cap(pb::Codec::Hevc, pb::Chroma::Yuv420, main10_hw) });
     pb::ClientCaps { decoders, max_width: 0, max_height: 0, max_fps }
 }
