@@ -44,6 +44,12 @@ fn button_of(b: &MouseButton) -> Option<(pb::MouseButton, u8)> {
     })
 }
 
+impl ExtraWindow {
+    pub fn focused(&self) -> bool {
+        self.focused
+    }
+}
+
 impl App {
     /// Open (or bring forward) a window for host display `display_id`.
     pub(super) fn open_extra(&mut self, el: &ActiveEventLoop, display_id: u32) {

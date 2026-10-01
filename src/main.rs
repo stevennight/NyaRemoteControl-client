@@ -165,7 +165,7 @@ fn real_main() -> Result<()> {
     let identity = Identity::load_or_create(&dir)?;
     let rt = tokio::runtime::Runtime::new()?;
     let event_loop = EventLoop::<UiEvent>::with_user_event().build().map_err(|e| anyhow!("{e}"))?;
-    let ui = Ui(event_loop.create_proxy());
+    let ui = Ui::new(event_loop.create_proxy());
     let mut app = app::App::new(rt.handle().clone(), ui, dir, cfg, identity, auto_connect);
     event_loop.run_app(&mut app).map_err(|e| anyhow!("{e}"))?;
     // Let the Bye go out.

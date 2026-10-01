@@ -95,7 +95,7 @@ impl App {
                     w.resize(size);
                 }
             }
-            WindowEvent::CloseRequested if self.session.is_some() => {
+            WindowEvent::CloseRequested if self.any_session() => {
                 // The session goes on in its own window; keep the launcher reachable.
                 if let Some(l) = &self.launcher {
                     l.set_minimized(true);
@@ -105,6 +105,9 @@ impl App {
                 self.cancel_connect();
                 self.exit = true;
                 el.exit();
+            }
+            WindowEvent::Focused(true) => {
+                // Remote sessions keep running; nothing to route here.
             }
             _ => {}
         }
@@ -189,15 +192,16 @@ impl App {
             "state" => Ok(self.web_state()),
             "connect" => (|| {
                 let a = args(&c)?;
-                if self.session.is_some() {
-                    return Err("已经有一个远程会话，请先在远程窗口里断开".to_string());
-                }
                 if self.pending.is_some() {
                     return Err("正在连接中".to_string());
                 }
                 let address = a.address.trim().to_owned();
                 if address.is_empty() {
                     return Err("请输入地址".to_string());
+                }
+                let address = self.cfg.find(&address).map(|h| h.address.clone()).unwrap_or(address);
+                if self.connected_to(&address) {
+                    return Err("已经连接着这台设备（见它的远程窗口）".to_string());
                 }
                 self.connect(address, a.name.filter(|n| !n.trim().is_empty()), None);
                 Ok(Value::Null)

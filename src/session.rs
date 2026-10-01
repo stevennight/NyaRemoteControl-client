@@ -700,7 +700,7 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.set_mic(false);
-        input::set_session(None);
+        input::end_session(&self.net_tx);
         let _ = self.net_tx.send(NetCmd::Quit);
     }
 }

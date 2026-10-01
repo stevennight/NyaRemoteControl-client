@@ -95,13 +95,29 @@ pub enum UiEvent {
     Web(nya_webui::Call),
     /// Late answer to a launcher request (work done on another thread).
     WebReply(u64, Result<serde_json::Value, String>),
+    /// An event of one connection (session window), see `Ui::for_conn`.
+    Conn(u64, Box<UiEvent>),
 }
 
 #[derive(Clone)]
-pub struct Ui(pub EventLoopProxy<UiEvent>);
+pub struct Ui {
+    proxy: EventLoopProxy<UiEvent>,
+    /// Connection the events belong to (0 = the app as a whole).
+    conn: u64,
+}
 
 impl Ui {
+    pub fn new(proxy: EventLoopProxy<UiEvent>) -> Self {
+        Self { proxy, conn: 0 }
+    }
+
+    /// A sender whose events are delivered to connection `conn`.
+    pub fn for_conn(&self, conn: u64) -> Self {
+        Self { proxy: self.proxy.clone(), conn }
+    }
+
     pub fn send(&self, ev: UiEvent) {
-        let _ = self.0.send_event(ev);
+        let ev = if self.conn == 0 { ev } else { UiEvent::Conn(self.conn, Box::new(ev)) };
+        let _ = self.proxy.send_event(ev);
     }
 }

@@ -25,6 +25,7 @@ use crate::render::{fit, Renderer};
 use crate::session::{DisplayChoice, Session, SessionOptions};
 use crate::ui::{self, Action};
 
+mod conn;
 mod extra;
 mod launcher;
 use launcher::{Kind, Phase};
@@ -48,6 +49,11 @@ pub struct App {
     cfg: ClientConfig,
     identity: Identity,
     auto_connect: Option<(String, Option<String>, crate::config::Overrides)>,
+    /// The current connection (see `conn`) and the parked others.
+    conn_id: u64,
+    next_conn: u64,
+    others: Vec<conn::Conn>,
+    hook_installed: bool,
     /// Settings of the running session (the host's, with command-line
     /// overrides), and the host's address to save changes under.
     sd: Defaults,
@@ -180,6 +186,10 @@ impl App {
             cfg,
             identity,
             auto_connect,
+            conn_id: 0,
+            next_conn: 0,
+            others: Vec::new(),
+            hook_installed: false,
             sd: Defaults::default(),
             session_host: String::new(),
             window: None,
@@ -456,6 +466,10 @@ impl App {
 
     fn finish_connect(&mut self, link: Box<Link>) {
         let Some(p) = self.pending.take() else { return };
+        if !self.activate_idle() {
+            self.notice(Kind::Error, "无法打开远程窗口");
+            return;
+        }
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let new_host = !self.cfg.hosts.iter().any(|h| h.address == p.address);
         let mut label = self.cfg.connected(&p.address, &link.welcome.server_name, link.server_fp.to_hex(), now);
@@ -499,7 +513,7 @@ impl App {
             extra: Default::default(),
         };
         let opts = SessionOptions { hw_decode: d.hw_decode, audio: d.audio, clipboard: d.clipboard };
-        let mut session = Session::start(&self.rt, *link, params, &dev, &opts, self.ui_tx.clone(), label);
+        let mut session = Session::start(&self.rt, *link, params, &dev, &opts, self.ui_tx.for_conn(self.conn_id), label);
         session.vd_supported = vd_supported;
         session.vd_follow_window = d.vd_size == "window";
         self.session = Some(session);
@@ -689,7 +703,7 @@ impl App {
                     if let Some(s) = &mut self.session {
                         s.usbipd_install = Some((true, "准备安装包…".into()));
                     }
-                    let ui = self.ui_tx.clone();
+                    let ui = self.ui_tx.for_conn(self.conn_id);
                     std::thread::spawn(move || {
                         let r = crate::usb::install_usbipd(&mut |m| ui.send(UiEvent::UsbipdInstall(true, m)));
                         ui.send(UiEvent::UsbipdInstall(
@@ -704,7 +718,7 @@ impl App {
                 Action::UsbAttach { busid, description, bound } => {
                     if let Some(s) = &mut self.session {
                         s.usb_busy.insert(busid.clone());
-                        let (net, ui) = (s.net_tx.clone(), self.ui_tx.clone());
+                        let (net, ui) = (s.net_tx.clone(), self.ui_tx.for_conn(self.conn_id));
                         std::thread::spawn(move || {
                             // Share it with usbipd first (UAC prompt), then ask the host to attach.
                             let shared = if bound { Ok(()) } else { crate::usb::bind(&busid) };
@@ -846,7 +860,7 @@ impl App {
         if let Some(s) = &mut self.session {
             s.usb_devices = None;
         }
-        let ui = self.ui_tx.clone();
+        let ui = self.ui_tx.for_conn(self.conn_id);
         // Looking for usbipd and listing devices start processes: never on the UI thread.
         std::thread::spawn(move || {
             let present = crate::usb::usbipd_exe().is_some();
@@ -1049,37 +1063,20 @@ impl ApplicationHandler<UiEvent> for App {
             .with_title("NyaRemoteControl")
             .with_inner_size(LogicalSize::new(1100.0, 760.0))
             .with_min_inner_size(LogicalSize::new(640.0, 480.0));
-        let session = Window::default_attributes()
-            .with_title("NyaRemoteControl")
-            .with_inner_size(LogicalSize::new(1280.0, 800.0))
-            .with_min_inner_size(LogicalSize::new(640.0, 480.0))
-            .with_visible(false);
-        let (launcher, window) = match (el.create_window(launcher), el.create_window(session)) {
-            (Ok(l), Ok(w)) => (Arc::new(l), Arc::new(w)),
-            (Err(e), _) | (_, Err(e)) => {
+        let launcher = match el.create_window(launcher) {
+            Ok(l) => Arc::new(l),
+            Err(e) => {
                 crate::fatal(&format!("无法创建窗口：{e}"));
                 el.exit();
                 return;
             }
         };
         self.launcher = Some(launcher);
-        self.window = Some(window.clone());
-        let dev = match device_for_window(&window) {
-            Ok(d) => d,
-            Err(e) => {
-                crate::fatal(&format!("无法创建 D3D11 设备：{e:#}"));
-                el.exit();
-                return;
-            }
-        };
-        if let Err(e) = self.create_renderer(dev) {
-            crate::fatal(&format!("无法初始化渲染：{e:#}"));
+        // The first (idle) session window, ready for a connection.
+        if let Err(e) = self.new_conn(el) {
+            crate::fatal(&format!("{e:#}"));
             el.exit();
             return;
-        }
-        tracing::info!("renderer on adapter luid {:#x}", self.adapter_luid);
-        if let Some(h) = hwnd(&window) {
-            input::install(h, self.ui_tx.clone());
         }
         self.create_web();
         let ui = self.ui_tx.clone();
@@ -1091,10 +1088,16 @@ impl ApplicationHandler<UiEvent> for App {
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
-        let Some(window) = self.window.clone() else { return };
         if self.launcher.as_ref().is_some_and(|l| l.id() == id) {
             return self.launcher_event(el, event);
         }
+        match self.conn_of_window(id) {
+            Some(c) => {
+                self.activate(c);
+            }
+            None => return,
+        }
+        let Some(window) = self.window.clone() else { return };
         if id != window.id() {
             return self.extra_event(id, event);
         }
@@ -1126,6 +1129,12 @@ impl ApplicationHandler<UiEvent> for App {
             WindowEvent::RedrawRequested => self.draw(),
             WindowEvent::Focused(f) => {
                 self.focused = *f;
+                if *f {
+                    // The keyboard hook sends keys to the focused session.
+                    if let Some(s) = &self.session {
+                        input::set_session(Some(s.net_tx.clone()));
+                    }
+                }
                 self.update_no_hotkeys();
                 if let Some(g) = self.session.as_ref().and_then(|s| s.gamepads.as_ref()) {
                     g.set_active(*f);
@@ -1174,6 +1183,7 @@ impl ApplicationHandler<UiEvent> for App {
 
     fn device_event(&mut self, _el: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
         if let DeviceEvent::MouseMotion { delta } = event {
+            self.activate_focused();
             if let Some(s) = &self.session {
                 if s.relative && self.focused {
                     let (dx, dy) = (delta.0.round() as i32, delta.1.round() as i32);
@@ -1186,6 +1196,19 @@ impl ApplicationHandler<UiEvent> for App {
     }
 
     fn user_event(&mut self, el: &ActiveEventLoop, event: UiEvent) {
+        let event = match event {
+            UiEvent::Conn(id, ev) => {
+                if !self.activate(id) {
+                    return; // that connection is gone
+                }
+                *ev
+            }
+            UiEvent::Hotkey(h) => {
+                self.activate_focused();
+                UiEvent::Hotkey(h)
+            }
+            ev => ev,
+        };
         match event {
             UiEvent::Frame(0) => return self.draw(),
             UiEvent::Frame(slot) => {
@@ -1336,6 +1359,20 @@ impl ApplicationHandler<UiEvent> for App {
             el.exit();
             return;
         }
+        let mut wake = Instant::now() + Duration::from_millis(250);
+        for id in self.conn_ids() {
+            if self.activate(id) {
+                wake = wake.min(self.conn_tick(el));
+            }
+        }
+        self.keep_one_idle(el);
+        el.set_control_flow(ControlFlow::WaitUntil(wake));
+    }
+}
+
+impl App {
+    /// Timers and queued work of the current connection; returns when to wake up next.
+    fn conn_tick(&mut self, el: &ActiveEventLoop) -> Instant {
         if std::mem::take(&mut self.sync_extras) {
             self.sync_extras();
         }
@@ -1371,7 +1408,6 @@ impl ApplicationHandler<UiEvent> for App {
         }
         let next = Instant::now() + Duration::from_millis(250);
         let wake = self.repaint_at.map_or(next, |t| t.min(next));
-        let wake = self.vd_resize_at.map_or(wake, |t| t.min(wake));
-        el.set_control_flow(ControlFlow::WaitUntil(wake));
+        self.vd_resize_at.map_or(wake, |t| t.min(wake))
     }
 }

@@ -114,6 +114,15 @@ pub fn set_session(tx: Option<UnboundedSender<NetCmd>>) {
     reset_modifiers();
 }
 
+/// A session ended: stop forwarding if keys were going to it (another
+/// session's window may have the keyboard by now).
+pub fn end_session(tx: &UnboundedSender<NetCmd>) {
+    let ours = state().tx.lock().unwrap().as_ref().is_some_and(|t| t.same_channel(tx));
+    if ours {
+        set_session(None);
+    }
+}
+
 pub fn set_grab(on: bool) {
     state().grab.store(on, Ordering::SeqCst);
 }
