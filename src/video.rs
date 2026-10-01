@@ -144,6 +144,12 @@ impl Ring {
                         let s = vec![srv(dev, &t, DXGI_FORMAT_R16_UNORM)?, srv(dev, &t, DXGI_FORMAT_R16G16_UNORM)?];
                         (vec![t], s)
                     }
+                    PixelLayout::P010Cpu => {
+                        let y = mk(DXGI_FORMAT_R16_UNORM, w, h)?;
+                        let uv = mk(DXGI_FORMAT_R16G16_UNORM, w.div_ceil(2), h.div_ceil(2))?;
+                        let s = vec![srv(dev, &y, DXGI_FORMAT_R16_UNORM)?, srv(dev, &uv, DXGI_FORMAT_R16G16_UNORM)?];
+                        (vec![y, uv], s)
+                    }
                     PixelLayout::Yuv420p10 => {
                         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
                         let t = vec![mk(DXGI_FORMAT_R16_UNORM, w, h)?, mk(DXGI_FORMAT_R16_UNORM, cw, ch)?, mk(DXGI_FORMAT_R16_UNORM, cw, ch)?];
@@ -177,7 +183,7 @@ impl Ring {
 
 fn depth_of(layout: PixelLayout) -> Depth {
     match layout {
-        PixelLayout::P010 => Depth::TenMsb,
+        PixelLayout::P010 | PixelLayout::P010Cpu => Depth::TenMsb,
         PixelLayout::Yuv420p10 => Depth::TenLsb,
         _ => Depth::Eight,
     }
@@ -185,7 +191,7 @@ fn depth_of(layout: PixelLayout) -> Depth {
 
 fn kind_of(layout: PixelLayout) -> SlotKind {
     match layout {
-        PixelLayout::Nv12 | PixelLayout::Nv12Cpu | PixelLayout::P010 => SlotKind::Nv12,
+        PixelLayout::Nv12 | PixelLayout::Nv12Cpu | PixelLayout::P010 | PixelLayout::P010Cpu => SlotKind::Nv12,
         PixelLayout::Ayuv => SlotKind::Ayuv,
         _ => SlotKind::Planar,
     }
@@ -330,8 +336,15 @@ impl VideoThread {
 
                     if dec.as_ref().map(|d| (d.0, d.1)) != Some((codec, yuv444)) {
                         let hw = self.hw_allowed && !hw_failed.contains(&(codec, yuv444)) && self.hw_capable(codec, yuv444);
+                        // D3D11VA where the GPU has the format, else NVIDIA's NVDEC.
+                        let d3d11va = crate::caps::hardware_decoders(&dev).contains(&(
+                            crate::caps::pb_codec(codec),
+                            if yuv444 { pb::Chroma::Yuv444 } else { pb::Chroma::Yuv420 },
+                        ));
+                        let nvdec = !d3d11va && nya_media::nvdec::supports(codec, yuv444, false);
                         let opened = if hw {
-                            VideoDecoder::new(codec, dev.device_raw_owned()).or_else(|e| {
+                            let first = if nvdec { VideoDecoder::new_nvdec(codec) } else { VideoDecoder::new(codec, dev.device_raw_owned()) };
+                            first.or_else(|e| {
                                 // Remember and fall back to software right away.
                                 tracing::warn!("hardware decoder unavailable ({e:#}); using software decoding");
                                 hw_failed.insert((codec, yuv444));
@@ -344,7 +357,15 @@ impl VideoThread {
                         match opened {
                             Ok(d) => {
                                 self.stats.with(|s| {
-                                    s.decoder = format!("{} {}", codec.name(), if d.is_hardware() { "硬解" } else { "软解" })
+                                    s.decoder = format!(
+                                        "{} {}",
+                                        codec.name(),
+                                        match (d.is_hardware(), d.gpu_frames()) {
+                                            (true, true) => "硬解",
+                                            (true, false) => "硬解（NVDEC）",
+                                            _ => "软解",
+                                        }
+                                    )
                                 });
                                 dec = Some((codec, yuv444, d));
                             }
@@ -359,8 +380,9 @@ impl VideoThread {
                     let mut cpu_fallback = false;
                     let d = &mut dec.as_mut().unwrap().2;
                     let hw = d.is_hardware();
+                    let gpu = d.gpu_frames();
                     let r = d.decode(payload, |f| {
-                        if hw && matches!(f.data, FrameData::Cpu { .. }) {
+                        if gpu && matches!(f.data, FrameData::Cpu { .. }) {
                             cpu_fallback = true;
                         }
                         match upload(&dev, &mut ring, f) {
