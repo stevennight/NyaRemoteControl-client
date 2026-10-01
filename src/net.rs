@@ -279,7 +279,14 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
             }
         }
     });
-    let dgram = tokio::spawn(read_datagrams(conn.clone(), sinks.audio.clone(), neg.has(Feature::Audio)));
+    let dgram = tokio::spawn(read_datagrams(
+        conn.clone(),
+        sinks.audio.clone(),
+        neg.has(Feature::Audio),
+        sinks.video.clone(),
+        sinks.stats.clone(),
+        neg.has(Feature::VideoDatagram),
+    ));
     let mut ping = tokio::time::interval(Duration::from_secs(1));
     let clipboard = neg.has(Feature::ClipboardText);
 
@@ -468,18 +475,7 @@ async fn accept_uni(
                         if r.read_exact(&mut buf).await.is_err() {
                             return;
                         }
-                        let first = stats.with(|s| {
-                            s.bytes += len as u64;
-                            s.total_rx_bytes += len as u64;
-                            s.total_rx_frames += 1;
-                            s.total_rx_frames == 1
-                        });
-                        if first {
-                            tracing::info!("first video frame received: stream {stream_id}, {len} bytes");
-                        }
-                        if video.try_send(VideoIn::Frame { stream_id, buf }).is_err() {
-                            tracing::warn!("decoder queue full; dropping frame");
-                        }
+                        deliver(&video, &stats, stream_id, buf);
                     }
                 }
                 Ok(Some(stream_type::CURSOR)) => {
@@ -497,15 +493,60 @@ async fn accept_uni(
     }
 }
 
-async fn read_datagrams(conn: Connection, audio: Sender<AudioPacket>, enabled: bool) {
+/// A received frame (video frame header + payload) to its window's decoder.
+fn deliver(video: &Sender<VideoIn>, stats: &Shared, stream_id: u64, buf: Vec<u8>) {
+    let len = buf.len() as u64;
+    let first = stats.with(|s| {
+        s.bytes += len;
+        s.total_rx_bytes += len;
+        s.total_rx_frames += 1;
+        s.total_rx_frames == 1
+    });
+    if first {
+        tracing::info!("first video frame received: stream {stream_id}, {len} bytes");
+    }
+    if video.try_send(VideoIn::Frame { stream_id, buf }).is_err() {
+        tracing::warn!("decoder queue full; dropping frame");
+    }
+}
+
+/// Audio, and video sent as datagrams with FEC (FEATURE_VIDEO_DATAGRAM).
+async fn read_datagrams(
+    conn: Connection,
+    audio: Sender<AudioPacket>,
+    audio_on: bool,
+    video: Arc<VideoRoutes>,
+    stats: Arc<Shared>,
+    video_on: bool,
+) {
+    let mut frames = nya_transport::videodgram::Reassembler::new(MAX_VIDEO_FRAME_LEN);
+    let mut published = Instant::now();
+    let mut first = true;
     while let Ok(d) = conn.read_datagram().await {
-        if !enabled || d.is_empty() {
-            continue;
-        }
-        if d[0] == datagram_type::AUDIO {
-            if let Some(p) = AudioPacket::decode(&d) {
-                let _ = audio.try_send(p);
+        match d.first() {
+            Some(&datagram_type::AUDIO) if audio_on => {
+                if let Some(p) = AudioPacket::decode(&d) {
+                    let _ = audio.try_send(p);
+                }
             }
+            Some(&datagram_type::VIDEO) if video_on => {
+                if first {
+                    first = false;
+                    tracing::info!("video arrives as datagrams with FEC");
+                }
+                if let Some(f) = frames.push(&d) {
+                    match video.get(f.slot as u32) {
+                        Some(tx) => deliver(&tx, &stats, f.stream_id, f.data),
+                        None => tracing::debug!("ignoring video frame for slot {}: no window", f.slot),
+                    }
+                }
+                if published.elapsed() >= Duration::from_millis(250) {
+                    published = Instant::now();
+                    let st = frames.take_stats();
+                    stats.with(|s| s.dgram.add(&st));
+                }
+            }
+            _ => {}
         }
     }
 }

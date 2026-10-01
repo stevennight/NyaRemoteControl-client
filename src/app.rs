@@ -167,6 +167,11 @@ fn start_request(d: &Defaults, setup: Option<pb::DisplaySetup>) -> pb::StartStre
             bitrate_kbps: if d.unlimited_bitrate { UNLIMITED_KBPS } else { d.bitrate_kbps },
             mode: if game { pb::StreamMode::Game } else { pb::StreamMode::Office } as i32,
             bitrate_policy: crate::ui::parse_policy(&d.bitrate_policy) as i32,
+            video_transport: match d.video_transport.as_str() {
+                "stream" => pb::VideoTransport::Stream,
+                "datagram" => pb::VideoTransport::Datagram,
+                _ => pb::VideoTransport::Auto,
+            } as i32,
         }),
         encoder_preference: d.encoder.clone(),
     }

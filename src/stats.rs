@@ -20,6 +20,8 @@ pub struct Stats {
     pub decoder: String,
     /// Audio jitter buffer (published by the audio thread).
     pub audio: Option<JitterStats>,
+    /// Video datagrams of the interval (FEATURE_VIDEO_DATAGRAM).
+    pub dgram: DgramTotals,
     /// Samples of the last 10 s, for the 99th percentiles.
     decode_window: Rolling,
     render_window: Rolling,
@@ -29,6 +31,30 @@ pub struct Stats {
     pub total_rx_bytes: u64,
     pub total_decoded: u64,
     pub total_rendered: u64,
+}
+
+/// Video datagram counters added up over a statistics interval.
+#[derive(Default, Clone, Copy)]
+pub struct DgramTotals {
+    pub shards_received: u32,
+    pub shards_lost: u32,
+    pub frames_recovered: u32,
+    pub frames_lost: u32,
+}
+
+impl DgramTotals {
+    pub fn add(&mut self, s: &nya_transport::videodgram::DgramStats) {
+        self.shards_received += s.shards_received;
+        self.shards_lost += s.shards_lost;
+        self.frames_recovered += s.frames_recovered;
+        self.frames_lost += s.frames_lost;
+    }
+
+    /// Lost shards in percent.
+    pub fn loss_pct(&self) -> f32 {
+        let total = self.shards_received + self.shards_lost;
+        if total == 0 { 0.0 } else { self.shards_lost as f32 * 100.0 / total as f32 }
+    }
 }
 
 pub struct Shared(pub Mutex<Stats>);
@@ -77,6 +103,7 @@ pub struct Summary {
     pub kbps: u32,
     pub decoder: String,
     pub audio: Option<JitterStats>,
+    pub dgram: DgramTotals,
 }
 
 impl Shared {
@@ -99,6 +126,7 @@ impl Shared {
                 kbps: (s.bytes as f32 * 8.0 / 1000.0 / secs) as u32,
                 decoder: s.decoder.clone(),
                 audio: s.audio,
+                dgram: std::mem::take(&mut s.dgram),
             };
             s.frames_decoded = 0;
             s.frames_rendered = 0;

@@ -648,6 +648,10 @@ impl Session {
             render_ms_p50: s.render_ms,
             frames_dropped: s.dropped,
             fps: s.fps,
+            video_shards_received: s.dgram.shards_received,
+            video_shards_lost: s.dgram.shards_lost,
+            video_frames_recovered: s.dgram.frames_recovered,
+            video_frames_lost: s.dgram.frames_lost,
         })));
         true
     }
@@ -681,6 +685,16 @@ fn stream_lines(lines: &mut Vec<String>, stream: Option<&pb::StreamStarted>, ser
     lines.push(format!("码率  实际 {:.1} Mbps   上限 {:.1} Mbps", kbps as f32 / 1000.0, target as f32 / 1000.0));
     if main && !note.is_empty() {
         lines.push(format!("策略  {note}"));
+    }
+    let fec = server.map(|x| x.fec_percent).unwrap_or(0);
+    if main && fec > 0 {
+        let d = &s.dgram;
+        lines.push(format!(
+            "传输  数据报 + 纠错 {fec}%   丢包 {:.1}%   纠错恢复 {} 帧   丢帧 {}",
+            d.loss_pct(),
+            d.frames_recovered,
+            d.frames_lost
+        ));
     }
     let latency = format!("延迟  端到端 {:.1} ms（P99 {:.1}）", s.latency_ms, s.latency_p99);
     if main {

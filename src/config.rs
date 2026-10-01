@@ -48,6 +48,8 @@ pub struct Defaults {
     pub unlimited_bitrate: bool,
     /// "auto" | "quality" | "balanced" | "smooth" | "fixed"
     pub bitrate_policy: String,
+    /// How video travels: "auto" (datagrams + FEC in game mode) | "stream" | "datagram"
+    pub video_transport: String,
     /// 0 = local monitor refresh rate.
     pub max_fps: u32,
     /// "auto" | "nvenc" | "qsv" | "amf" | "software"
@@ -89,6 +91,7 @@ impl Default for Defaults {
             bitrate_kbps: 0,
             unlimited_bitrate: false,
             bitrate_policy: "auto".into(),
+            video_transport: "auto".into(),
             max_fps: 0,
             encoder: "auto".into(),
             codec: "auto".into(),
