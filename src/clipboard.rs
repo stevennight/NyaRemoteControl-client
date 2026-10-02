@@ -30,7 +30,7 @@ const PASTE_TIMEOUT: Duration = Duration::from_secs(3600);
 
 /// Fetch the host's files of `id` through the network task.
 fn provider(id: u64, net: UnboundedSender<NetCmd>) -> nya_win::clipboard_files::Provider {
-    Box::new(move || {
+    std::sync::Arc::new(move || {
         let (tx, rx) = std::sync::mpsc::channel();
         tracing::info!("host files pasted here; fetching (offer {id:016x})");
         net.send(NetCmd::ClipboardPaste(id, tx)).map_err(|_| "会话已结束".to_string())?;
