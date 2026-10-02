@@ -67,10 +67,6 @@ const POLICIES: [(&str, &str, &str); 5] = [
     ("fixed", "固定码率", "从不自动调整"),
 ];
 
-fn policy_label(s: &str) -> &'static str {
-    POLICIES.iter().find(|p| p.0 == s).map(|p| p.1).unwrap_or("自动")
-}
-
 /// Controls for the host display setup; returns true if something changed.
 fn display_choice_ui(ui: &mut egui::Ui, c: &mut crate::session::DisplayChoice) -> bool {
     let before = *c;
@@ -107,7 +103,18 @@ fn size_text(b: u64) -> String {
 
 const DIM: Color32 = Color32::from_rgb(0x9a, 0xa0, 0xab);
 const OK: Color32 = Color32::from_rgb(0x3c, 0xcf, 0x8e);
+const WARN: Color32 = Color32::from_rgb(0xff, 0xc0, 0x5c);
 const DANGER: Color32 = Color32::from_rgb(0xff, 0x8f, 0x86);
+const BAR_FILL: Color32 = Color32::from_rgba_premultiplied(25, 27, 32, 235);
+
+/// Colour of an end-to-end latency: good / fair / poor (0 = not known yet).
+fn latency_color(ms: f32) -> Color32 {
+    match ms {
+        m if m < 60.0 => OK,
+        m if m < 120.0 => WARN,
+        _ => DANGER,
+    }
+}
 
 fn bar_separator(ui: &mut egui::Ui) {
     ui.add_space(4.0);
@@ -129,6 +136,10 @@ fn display_title(s: &Session) -> String {
 /// Host displays to switch to, then the display setup (virtual screens, privacy).
 fn displays_menu(ui: &mut egui::Ui, s: &Session, actions: &mut Vec<Action>) {
     ui.set_min_width(330.0);
+    if s.watching() {
+        ui.label(RichText::new("观看时只显示被控端的主画面，切换和更改显示器由正在操作的人决定").color(DIM));
+        return;
+    }
     ui.label(RichText::new("被控端的显示器").small().color(DIM));
     if let Some(info) = &s.info {
         let current = s.stream.as_ref().map(|x| x.display_id).unwrap_or(s.start.display_id);
@@ -211,71 +222,87 @@ pub enum ExtraAction {
 }
 
 /// Toolbar of an extra window (another host display): name, fullscreen, close.
-/// Same behaviour as the main bar: a thin tab until the pointer reaches the top.
+/// Opens and hides like the main bar.
 pub fn extra_overlay(ctx: &egui::Context, title: &str, status: &str, fullscreen: bool) -> ExtraAction {
     let mut action = ExtraAction::None;
-    let pointer = ctx.input(|i| i.pointer.hover_pos());
-    let near_top = pointer.is_some_and(|p| p.y < 48.0);
-    let show = near_top || ctx.memory(|m| m.any_popup_open());
-    egui::Area::new(egui::Id::new("extra-toolbar"))
-        .anchor(Align2::CENTER_TOP, [0.0, if show { 8.0 } else { 0.0 }])
-        .order(egui::Order::Foreground)
-        .show(ctx, |ui| {
-            let frame = egui::Frame::NONE.fill(Color32::from_rgba_unmultiplied(28, 30, 36, 235)).stroke(egui::Stroke::new(1.0_f32, Color32::from_white_alpha(18)));
-            if !show {
-                frame
-                    .corner_radius(egui::CornerRadius { nw: 0, ne: 0, sw: 8, se: 8 })
-                    .inner_margin(egui::Margin::symmetric(12, 2))
-                    .show(ui, |ui| ui.label(RichText::new(format!("▾ {title}")).small().color(DIM)));
-                return;
+    auto_hide_bar(ctx, "extra-toolbar", false, title, |ui, _| {
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label(RichText::new(title).strong().color(Color32::WHITE));
+            bar_separator(ui);
+            let mut fs = fullscreen;
+            if ui.toggle_value(&mut fs, "全屏").changed() {
+                action = ExtraAction::ToggleFullscreen;
             }
-            frame.corner_radius(12).inner_margin(egui::Margin::same(4)).show(ui, |ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                ui.horizontal(|ui| {
-                    ui.add_space(8.0);
-                    ui.label(RichText::new(title).strong().color(Color32::WHITE));
-                    bar_separator(ui);
-                    let mut fs = fullscreen;
-                    if ui.toggle_value(&mut fs, "全屏").changed() {
-                        action = ExtraAction::ToggleFullscreen;
-                    }
-                    if ui.button("关闭窗口").on_hover_text("只关闭这个窗口，不断开连接").clicked() {
-                        action = ExtraAction::Close;
-                    }
-                });
-            });
+            if ui.button("关闭窗口").on_hover_text("只关闭这个窗口，不断开连接").clicked() {
+                action = ExtraAction::Close;
+            }
         });
+    });
     if !status.is_empty() {
         egui::Area::new(egui::Id::new("extra-status"))
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
             .order(egui::Order::Foreground)
             .interactable(false)
             .show(ctx, |ui| {
-                egui::Frame::NONE.fill(Color32::from_rgba_unmultiplied(28, 30, 36, 235)).corner_radius(10).inner_margin(egui::Margin::symmetric(14, 8)).show(ui, |ui| {
+                egui::Frame::NONE.fill(BAR_FILL).corner_radius(10).inner_margin(egui::Margin::symmetric(14, 8)).show(ui, |ui| {
                     ui.label(RichText::new(status).color(Color32::WHITE));
                 });
             });
     }
-    if pointer.is_some_and(|p| p.y < 60.0) {
-        ctx.request_repaint_after(std::time::Duration::from_millis(100));
-    }
     action
 }
 
-/// Less frequent session controls.
-fn more_menu(ui: &mut egui::Ui, s: &Session, actions: &mut Vec<Action>) {
-    ui.set_min_width(230.0);
-    let mut stats = s.show_stats;
-    if ui.toggle_value(&mut stats, "统计信息").on_hover_text("Ctrl+Alt+Shift+S").changed() {
-        actions.push(Action::Hotkey(Hotkey::ToggleStats));
+/// Picture mode and what to do when the network gets worse.
+fn mode_menu(ui: &mut egui::Ui, s: &Session, actions: &mut Vec<Action>) {
+    ui.set_min_width(260.0);
+    ui.label(RichText::new("画面模式（Ctrl+Alt+Shift+M）").small().color(DIM));
+    let modes = [
+        (false, "办公 · 清晰", "文字清晰（本机能硬件解码时用 HEVC 4:4:4），画面静止后补发清晰帧；画面不变时几乎不占带宽"),
+        (true, "游戏 · 流畅", "4:2:0，高帧率（跟随本机显示器刷新率），延迟最低"),
+    ];
+    for (game, name, tip) in modes {
+        if ui.selectable_label(s.game == game, name).on_hover_text(tip).clicked() {
+            if s.game != game {
+                actions.push(Action::SetGameMode(game));
+            }
+            ui.close_menu();
+        }
     }
+    ui.separator();
+    ui.label(RichText::new("网络变差时").small().color(DIM));
+    let current = s.bitrate_policy();
+    let cur_key = POLICIES.iter().find(|p| parse_policy(p.0) as i32 == current).map(|p| p.0).unwrap_or("auto");
+    for (key, name, tip) in POLICIES {
+        if ui.selectable_label(key == cur_key, name).on_hover_text(tip).clicked() {
+            if key != cur_key {
+                actions.push(Action::SetPolicy(parse_policy(key)));
+            }
+            ui.close_menu();
+        }
+    }
+    if let Some(st) = s.server_stats.as_ref().filter(|st| st.target_kbps > 0) {
+        ui.label(
+            RichText::new(format!("当前 {:.1} Mbps，上限 {:.1} Mbps", st.bitrate_kbps as f32 / 1000.0, st.target_kbps as f32 / 1000.0))
+                .small()
+                .color(DIM),
+        );
+    }
+}
+
+/// Relative mouse (locked in the window) on / off.
+fn mouse_lock_toggle(ui: &mut egui::Ui, s: &Session, actions: &mut Vec<Action>) {
     let mut rel = s.relative;
-    if ui.toggle_value(&mut rel, "相对鼠标（游戏）").on_hover_text("鼠标锁在窗口内，Ctrl+Alt+Shift+R").changed() {
+    if ui.toggle_value(&mut rel, "锁定鼠标").on_hover_text("相对鼠标：鼠标锁在窗口内，适合 FPS 游戏。Ctrl+Alt+Shift+R").changed() {
         actions.push(Action::Hotkey(Hotkey::ToggleRelative));
     }
-    let mut mic = s.mic_on();
+}
+
+/// Local microphone into the host's virtual cable on / off.
+fn mic_toggle(ui: &mut egui::Ui, s: &Session, actions: &mut Vec<Action>) {
     match s.host_mic_device() {
         Some(dev) => {
+            let mut mic = s.mic_on();
             if ui
                 .toggle_value(&mut mic, "麦克风")
                 .on_hover_text(format!("本机麦克风 → 被控端“{dev}”。被控端软件请选择 CABLE Output 作为麦克风"))
@@ -289,13 +316,34 @@ fn more_menu(ui: &mut egui::Ui, s: &Session, actions: &mut Vec<Action>) {
                 .on_disabled_hover_text("被控端没有安装虚拟声卡（可在被控端管理程序“可选组件”中安装）");
         }
     }
-    if s.usb_available() {
-        let mut open = s.usb_open;
-        if ui.toggle_value(&mut open, "USB 设备透传…").changed() {
-            actions.push(Action::ToggleUsb);
+}
+
+/// Less frequent session controls. `compact`: the bar left out the mouse
+/// lock and microphone switches (narrow window), so they are here.
+fn more_menu(ui: &mut egui::Ui, s: &Session, compact: bool, actions: &mut Vec<Action>) {
+    ui.set_min_width(230.0);
+    ui.add_enabled_ui(!s.watching(), |ui| {
+        if compact {
+            mouse_lock_toggle(ui, s, actions);
+            mic_toggle(ui, s, actions);
+            ui.separator();
+        }
+        if ui.button("发送文件…").on_hover_text("也可以直接把文件拖进窗口").clicked() {
+            actions.push(Action::PickFiles);
             ui.close_menu();
         }
-    }
+        if ui.button("发送 Ctrl+Alt+Del").on_hover_text("Ctrl+Alt+Shift+D，需要被控端以服务模式运行").clicked() {
+            actions.push(Action::Hotkey(Hotkey::CtrlAltDel));
+            ui.close_menu();
+        }
+        if s.usb_available() {
+            let mut open = s.usb_open;
+            if ui.toggle_value(&mut open, "USB 设备透传…").changed() {
+                actions.push(Action::ToggleUsb);
+                ui.close_menu();
+            }
+        }
+    });
     if let Some(g) = &s.gamepads {
         let n = g.count();
         if n > 0 {
@@ -303,65 +351,105 @@ fn more_menu(ui: &mut egui::Ui, s: &Session, actions: &mut Vec<Action>) {
         }
     }
     ui.separator();
-    if ui.button("发送文件…").on_hover_text("也可以直接把文件拖进窗口").clicked() {
-        actions.push(Action::PickFiles);
-        ui.close_menu();
+    let mut stats = s.show_stats;
+    if ui.toggle_value(&mut stats, "统计信息").on_hover_text("Ctrl+Alt+Shift+S").changed() {
+        actions.push(Action::Hotkey(Hotkey::ToggleStats));
     }
-    if ui.button("发送 Ctrl+Alt+Del").on_hover_text("Ctrl+Alt+Shift+D，需要被控端以服务模式运行").clicked() {
-        actions.push(Action::Hotkey(Hotkey::CtrlAltDel));
-        ui.close_menu();
-    }
-    ui.separator();
-    let current = s.bitrate_policy();
-    let cur_key = POLICIES.iter().find(|p| parse_policy(p.0) as i32 == current).map(|p| p.0).unwrap_or("auto");
-    ui.menu_button(format!("网络变差时：{}", policy_label(cur_key)), |ui| {
-        for (key, name, tip) in POLICIES {
-            if ui.selectable_label(key == cur_key, name).on_hover_text(tip).clicked() {
-                actions.push(Action::SetPolicy(parse_policy(key)));
-                ui.close_menu();
-            }
-        }
-    });
+    ui.label(RichText::new("Ctrl+Alt+Shift+T 让工具条一直显示").small().color(DIM));
 }
 
-/// A bar at the top of a session window that shows while the pointer is at
-/// the top edge or on it (or `pinned`), stays while one of its menus is open,
-/// and hides a moment after the pointer leaves; hidden, a thin tab with
-/// `tab` remains. `contents` draws the bar and sets its `bool` when a menu of
-/// the bar is open. `id` keeps separate bars apart.
+/// How long the pointer has to rest on the handle before the bar opens.
+const HANDLE_DWELL_S: f64 = 0.25;
+/// How long the bar stays after the pointer left it.
+const BAR_LINGER_S: f64 = 0.4;
+
+#[derive(Clone, Copy, Default)]
+struct BarState {
+    /// The bar was drawn last frame, at this rectangle.
+    shown: Option<egui::Rect>,
+    open_until: f64,
+    menu_open: bool,
+    /// The pointer has been resting on the handle since then.
+    hover_since: Option<f64>,
+    /// Horizontal offset from the centre (the handle can be dragged aside).
+    offset_x: f32,
+}
+
+/// A bar at the top of a session window. Hidden, only a small handle with
+/// `tab` remains at the top edge, so the remote picture under the bar stays
+/// clickable: the bar opens when the pointer rests on the handle (or it is
+/// clicked, or `pinned`), stays while the pointer is on it or one of its menus
+/// is open, and hides a moment after the pointer leaves. The handle can be
+/// dragged sideways out of the way; the bar opens where the handle is.
+/// `contents` draws the bar and sets its `bool` when a menu of the bar is
+/// open. `id` keeps separate bars apart.
 pub fn auto_hide_bar(ctx: &egui::Context, id: &str, pinned: bool, tab: &str, contents: impl FnOnce(&mut egui::Ui, &mut bool)) {
     let state_id = egui::Id::new((id, "state"));
-    let (last_rect, open_until, menu_was_open): (Option<egui::Rect>, f64, bool) =
-        ctx.data(|d| d.get_temp(state_id)).unwrap_or((None, 0.0, false));
+    let mut st: BarState = ctx.data(|d| d.get_temp(state_id)).unwrap_or_default();
     let now = ctx.input(|i| i.time);
     let pointer = ctx.input(|i| i.pointer.hover_pos());
-    let near_top = pointer.is_some_and(|p| p.y < 6.0);
-    let on_bar = matches!((pointer, last_rect), (Some(p), Some(r)) if r.expand(16.0).contains(p));
+    // Only the bar as it is on screen counts; while hidden, its old place is
+    // the remote picture again.
+    let on_bar = matches!((pointer, st.shown), (Some(p), Some(r)) if r.expand(8.0).contains(p));
     // egui menus (display menu, "⋯") are not popups in egui's memory: the bar
     // remembers that one of its menus was open, or it would hide as soon as
     // the pointer moves down into the menu.
-    let hold = pinned || near_top || on_bar || menu_was_open || ctx.memory(|m| m.any_popup_open());
-    let show_bar = hold || now < open_until;
-    if show_bar && !hold {
+    let hold = pinned || on_bar || st.menu_open || ctx.memory(|m| m.any_popup_open());
+    let mut show_bar = hold || now < st.open_until;
+    let half = ctx.screen_rect().width() / 2.0;
+    st.offset_x = st.offset_x.clamp(-(half - 60.0).max(0.0), (half - 60.0).max(0.0));
+
+    if !show_bar {
+        let r = egui::Area::new(egui::Id::new((id, "handle")))
+            .anchor(Align2::CENTER_TOP, [st.offset_x, 0.0])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let f = egui::Frame::NONE
+                    .fill(BAR_FILL)
+                    .stroke(egui::Stroke::new(1.0_f32, Color32::from_white_alpha(18)))
+                    .corner_radius(egui::CornerRadius { nw: 0, ne: 0, sw: 8, se: 8 })
+                    .inner_margin(egui::Margin::symmetric(10, 1))
+                    .show(ui, |ui| ui.add(egui::Label::new(RichText::new(format!("▾ {tab}")).small().color(DIM)).selectable(false)));
+                ui.interact(f.response.rect, egui::Id::new((id, "grip")), egui::Sense::click_and_drag())
+            })
+            .inner;
+        if r.dragged() {
+            st.offset_x += r.drag_delta().x;
+            st.hover_since = None;
+        } else if r.clicked() {
+            show_bar = true;
+        } else if r.hovered() && !ctx.input(|i| i.pointer.any_down()) {
+            let since = *st.hover_since.get_or_insert(now);
+            if now - since >= HANDLE_DWELL_S {
+                show_bar = true;
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(HANDLE_DWELL_S - (now - since) + 0.01));
+            }
+        } else {
+            st.hover_since = None;
+        }
+        if !show_bar {
+            st.shown = None;
+            st.menu_open = false;
+            ctx.data_mut(|d| d.insert_temp(state_id, st));
+            return;
+        }
+        st.hover_since = None;
+        st.open_until = now + BAR_LINGER_S;
+    }
+
+    if !hold {
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
     let mut menu_open = false;
     let bar = egui::Area::new(egui::Id::new(id))
-        .anchor(Align2::CENTER_TOP, [0.0, if show_bar { 8.0 } else { 0.0 }])
+        .anchor(Align2::CENTER_TOP, [st.offset_x, 6.0])
         .order(egui::Order::Foreground)
         .show(ctx, |ui| {
             let frame = egui::Frame::NONE
-                .fill(Color32::from_rgba_unmultiplied(28, 30, 36, 235))
+                .fill(BAR_FILL)
                 .stroke(egui::Stroke::new(1.0_f32, Color32::from_white_alpha(18)))
                 .shadow(ui.visuals().popup_shadow);
-            if !show_bar {
-                // A thin tab at the top edge; hovering it (or Ctrl+Alt+Shift+T) opens the bar.
-                frame
-                    .corner_radius(egui::CornerRadius { nw: 0, ne: 0, sw: 8, se: 8 })
-                    .inner_margin(egui::Margin::symmetric(12, 2))
-                    .show(ui, |ui| ui.label(RichText::new(format!("▾ {tab}")).small().color(DIM)));
-                return;
-            }
             frame.corner_radius(12).inner_margin(egui::Margin::same(4)).show(ui, |ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
                 ui.spacing_mut().button_padding = egui::vec2(9.0, 5.0);
@@ -376,13 +464,15 @@ pub fn auto_hide_bar(ctx: &egui::Context, id: &str, pinned: bool, tab: &str, con
                 contents(ui, &mut menu_open);
             });
         });
-    if menu_open != menu_was_open {
+    if menu_open != st.menu_open {
         ctx.request_repaint();
     }
-    let until = if hold || menu_open { now + 0.8 } else { open_until };
-    // Keep the last shown rectangle: the tab is much smaller than the bar.
-    let rect = if show_bar { Some(bar.response.rect) } else { last_rect };
-    ctx.data_mut(|d| d.insert_temp(state_id, (rect, until, menu_open)));
+    if hold || menu_open {
+        st.open_until = now + BAR_LINGER_S;
+    }
+    st.shown = Some(bar.response.rect);
+    st.menu_open = menu_open;
+    ctx.data_mut(|d| d.insert_temp(state_id, st));
 }
 
 /// Another client operates the host: say so, offer to take over.
@@ -428,18 +518,35 @@ pub fn session_overlay(
         toolbar_open,
         &label,
         |ui, menu_open| {
+            // Narrow window: the mouse lock and microphone go into "⋯".
+            let compact = ui.ctx().screen_rect().width() < 760.0;
+            let watching = s.watching();
             ui.horizontal(|ui| {
+                // Who and how well: host name, latency (click: statistics), viewers.
                 ui.add_space(8.0);
+                let latency = s.summary.latency_ms;
+                let color = if latency > 0.0 { latency_color(latency) } else { DIM };
                 let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                ui.painter().circle_filled(dot.center(), 3.5, OK);
+                ui.painter().circle_filled(dot.center(), 3.5, color);
                 ui.add_space(4.0);
                 ui.label(RichText::new(&s.label).strong().color(Color32::WHITE));
+                if latency > 0.0 {
+                    let text = RichText::new(format!("{latency:.0} ms")).small().color(color);
+                    if ui
+                        .add(egui::Button::new(text).frame(false))
+                        .on_hover_text("端到端延迟。点击显示 / 隐藏统计信息（Ctrl+Alt+Shift+S）")
+                        .clicked()
+                    {
+                        actions.push(Action::Hotkey(Hotkey::ToggleStats));
+                    }
+                }
                 if let Some(r) = s.role.as_ref().filter(|r| r.controlling && !r.viewers.is_empty()) {
                     ui.label(RichText::new(format!("· {} 人观看", r.viewers.len())).small().color(DIM))
                         .on_hover_text(format!("正在观看：{}", r.viewers.join("、")));
                 }
                 bar_separator(ui);
 
+                // The picture: which host display, and how it is streamed.
                 // egui 0.31 returns a menu's contents only on the frame it closes, so
                 // the menu itself reports that it is open.
                 let r = ui.menu_button(format!("{} ▾", display_title(s)), |ui| {
@@ -447,28 +554,40 @@ pub fn session_overlay(
                     displays_menu(ui, s, actions)
                 });
                 r.response.on_hover_text("被控端的显示器、虚拟显示器和隐私屏");
+                let r = ui.menu_button(format!("{} ▾", if s.game { "游戏" } else { "办公" }), |ui| {
+                    *menu_open = true;
+                    mode_menu(ui, s, actions)
+                });
+                r.response.on_hover_text("画面模式（办公 / 游戏）和网络变差时的策略");
+                bar_separator(ui);
 
-                let mode = if s.game { "游戏" } else { "办公" };
-                if ui.button(mode).on_hover_text("办公（清晰）/ 游戏（流畅）切换，Ctrl+Alt+Shift+M").clicked() {
-                    actions.push(Action::SetGameMode(!s.game));
-                }
-                let mut grab = input::grabbed();
-                if ui.toggle_value(&mut grab, "键盘").on_hover_text("捕获键盘：Win 键等组合键发给被控端，Ctrl+Alt+Shift+Q").changed() {
-                    actions.push(Action::SetGrab(grab));
-                }
+                // Input and devices sent to the host (only for the operator).
+                ui.add_enabled_ui(!watching, |ui| {
+                    let mut grab = input::grabbed();
+                    if ui.toggle_value(&mut grab, "键盘").on_hover_text("捕获键盘：Win 键等组合键发给被控端，Ctrl+Alt+Shift+Q").changed() {
+                        actions.push(Action::SetGrab(grab));
+                    }
+                    if !compact {
+                        mouse_lock_toggle(ui, s, actions);
+                        mic_toggle(ui, s, actions);
+                    }
+                });
+                let r = ui.menu_button("⋯", |ui| {
+                    *menu_open = true;
+                    more_menu(ui, s, compact, actions)
+                });
+                r.response.on_hover_text("发送文件、Ctrl+Alt+Del、USB、统计信息");
+                bar_separator(ui);
+
+                // The window and the connection.
                 let mut fs = fullscreen;
                 if ui.toggle_value(&mut fs, "全屏").on_hover_text("Ctrl+Alt+Shift+F").changed() {
                     actions.push(Action::Hotkey(Hotkey::ToggleFullscreen));
                 }
-                let r = ui.menu_button("⋯", |ui| {
-                    *menu_open = true;
-                    more_menu(ui, s, actions)
-                });
-                r.response.on_hover_text("更多");
-                bar_separator(ui);
                 if ui.button(RichText::new("断开").color(DANGER)).on_hover_text("Ctrl+Alt+Shift+X").clicked() {
                     actions.push(Action::Disconnect);
                 }
+                ui.add_space(4.0);
             });
         },
     );
@@ -759,15 +878,38 @@ mod bar_tests {
         }
     }
 
+    /// The handle at the top centre (before it is dragged).
+    const HANDLE: egui::Pos2 = egui::pos2(500.0, 6.0);
+
+    impl Sim {
+        fn press(&mut self, pressed: bool) {
+            let pos = self.pos;
+            self.frame(0.016, vec![egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() }]);
+        }
+
+        /// A window that has been showing for a moment (new egui areas
+        /// spend their first frame measuring themselves).
+        fn started() -> Self {
+            let mut s = Self::new();
+            s.frame(0.0, vec![]);
+            s.wait(0.5);
+            s
+        }
+
+        /// Rest on the handle until the bar opens.
+        fn open_from_handle(&mut self) {
+            self.move_to(HANDLE);
+            self.wait(0.5);
+        }
+    }
+
     #[test]
     fn stays_while_its_menu_is_open() {
-        let mut s = Sim::new();
-        s.frame(0.0, vec![]);
-        s.wait(1.5);
+        let mut s = Sim::started();
+        s.wait(1.0);
         assert!(!s.bar.get(), "hidden at first");
-        s.move_to(egui::pos2(500.0, 2.0));
-        s.move_to(egui::pos2(500.0, 2.0));
-        assert!(s.bar.get(), "shown at the top edge");
+        s.open_from_handle();
+        assert!(s.bar.get(), "opened by resting on the handle");
         let b = s.button.get().unwrap();
         s.move_to(b.center());
         s.click();
@@ -786,12 +928,70 @@ mod bar_tests {
 
     #[test]
     fn hides_after_the_pointer_leaves() {
-        let mut s = Sim::new();
-        s.move_to(egui::pos2(500.0, 2.0));
+        let mut s = Sim::started();
+        s.open_from_handle();
         s.move_to(egui::pos2(500.0, 20.0));
         assert!(s.bar.get());
         s.move_to(egui::pos2(500.0, 400.0));
-        s.wait(2.0);
+        s.wait(1.0);
         assert!(!s.bar.get());
+    }
+
+    #[test]
+    fn the_top_edge_and_a_passing_pointer_do_not_open_it() {
+        let mut s = Sim::started();
+        // Top edge away from the handle (e.g. a remote tab strip).
+        s.move_to(egui::pos2(150.0, 1.0));
+        s.wait(1.0);
+        assert!(!s.bar.get());
+        // Crossing the handle on the way somewhere else.
+        s.move_to(HANDLE);
+        s.move_to(egui::pos2(500.0, 120.0));
+        s.wait(1.0);
+        assert!(!s.bar.get());
+    }
+
+    #[test]
+    fn where_the_bar_was_is_the_remote_picture_again() {
+        let mut s = Sim::started();
+        s.open_from_handle();
+        let bar = s.button.get().unwrap();
+        s.move_to(egui::pos2(500.0, 400.0));
+        s.wait(1.0);
+        assert!(!s.bar.get());
+        // Below the handle, inside the area the bar covered.
+        s.move_to(egui::pos2(bar.center().x, bar.bottom()));
+        s.wait(1.0);
+        assert!(!s.bar.get(), "the old bar area must not reopen it");
+    }
+
+    #[test]
+    fn a_click_on_the_handle_opens_at_once() {
+        let mut s = Sim::started();
+        s.move_to(HANDLE);
+        s.click();
+        assert!(s.bar.get());
+    }
+
+    #[test]
+    fn the_handle_can_be_dragged_aside() {
+        let mut s = Sim::started();
+        s.move_to(HANDLE);
+        s.press(true);
+        for x in (200..500).rev().step_by(25) {
+            s.move_to(egui::pos2(x as f32, 6.0));
+            assert!(!s.bar.get(), "dragging does not open the bar");
+        }
+        s.press(false);
+        s.move_to(egui::pos2(500.0, 300.0));
+        s.wait(1.0);
+        // Not at the centre any more; at the new place it opens, there.
+        s.move_to(HANDLE);
+        s.wait(0.5);
+        assert!(!s.bar.get());
+        s.move_to(egui::pos2(200.0, 6.0));
+        s.wait(0.5);
+        assert!(s.bar.get());
+        assert!(s.button.get().unwrap().center().x < 400.0);
     }
 }
