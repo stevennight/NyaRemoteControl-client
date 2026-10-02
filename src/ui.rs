@@ -305,7 +305,7 @@ fn mic_toggle(ui: &mut egui::Ui, s: &Session, actions: &mut Vec<Action>) {
             let mut mic = s.mic_on();
             if ui
                 .toggle_value(&mut mic, "麦克风")
-                .on_hover_text(format!("本机麦克风 → 被控端“{dev}”。被控端软件请选择 CABLE Output 作为麦克风"))
+                .on_hover_text(format!("本机麦克风 → 被控端“{dev}”。打开期间 CABLE Output 自动成为被控端的默认麦克风"))
                 .changed()
             {
                 actions.push(Action::SetMic(mic));
